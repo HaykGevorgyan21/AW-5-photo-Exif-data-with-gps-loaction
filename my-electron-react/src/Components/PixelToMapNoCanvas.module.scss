@@ -1,0 +1,227 @@
+:root {
+  --bg: #111;
+  --pane: #1b1b1b;
+  --pane-2: #222;
+  --border: #333;
+  --border-2: #444;
+  --text: #eee;
+  --text-dim: #bbb;
+}
+
+.rootGrid {
+  display: grid;
+  grid-template-columns: 1fr 1fr 1fr;
+  gap: 16px;
+}
+.panel {
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  padding: 52px;
+  min-width: 380px;
+  //max-width: 680px;
+  background: var(--bg);
+}
+.dropzone {
+  border: 1px dashed #666;
+  border-radius: 12px;
+  padding: 12px;
+  text-align: center;
+}
+.dropHint {
+  margin-top: 8px;
+  color: var(--text-dim);
+}
+.preview {
+  position: relative;
+  margin-top: 12px;
+  width: 100%;
+  height: 320px;
+  background: var(--pane-2);
+  border-radius: 12px;
+  overflow: hidden;
+  border: 1px solid var(--border-2);
+  cursor: pointer;
+  user-select: none;
+}
+.previewOverlay {
+  position: absolute;
+  inset: 0;
+  background: linear-gradient(180deg, transparent, rgba(0, 0, 0, 0.35));
+  display: flex;
+  align-items: end;
+  justify-content: center;
+  padding: 8px;
+  color: #ddd;
+  font-size: 12px;
+}
+.monoDim {
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 12px;
+  margin-top: 8px;
+  color: #888;
+}
+.monoBright {
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 12px;
+  margin-top: 8px;
+  color: #ddd;
+}
+
+/* Modal */
+.modal {
+  position: fixed;
+  inset: 0;
+  background: rgba(0, 0, 0, 0.65);
+  z-index: 9999;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 24px;
+}
+.modalCard {
+  width: 92vw;
+  max-width: 1400px;
+  height: 86vh;
+  background: #111;
+  border: 1px solid #333;
+  border-radius: 14px;
+  box-shadow: 0 10px 40px rgba(0, 0, 0, 0.6);
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
+.modalHeader {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 10px 14px;
+  border-bottom: 1px solid #262626;
+  background: #0c0c0c;
+}
+.title {
+  color: #ddd;
+  font-weight: 600;
+}
+.headerBtns {
+  display: flex;
+  gap: 8px;
+}
+.btn {
+  padding: 6px 10px;
+  border-radius: 8px;
+  border: 1px solid #555;
+  background: #1b1b1b;
+  color: #eee;
+  cursor: pointer;
+}
+
+/* Body grid: make image pane bigger than others */
+.modalBody {
+  display: grid;
+  grid-template-columns: 1.8fr 1fr 0.9fr;
+  gap: 16px;
+  padding: 16px;
+  overflow: hidden;
+}
+.imagePane,
+.infoPane,
+.resultPane {
+  border: 1px solid #333;
+  border-radius: 12px;
+  padding: 12px;
+  min-width: 300px;
+  overflow: hidden;
+  background: #111;
+}
+.infoPane,
+.resultPane { overflow: auto; }
+
+.viewer {
+  position: relative;
+  width: 100%;
+  height: 100%;
+  min-height: 480px;
+  background: #222;
+  border-radius: 12px;
+  overflow: hidden;
+  border: 1px solid #444;
+  user-select: none;
+}
+.crosshair { cursor: crosshair; }
+.grabbing { cursor: grabbing; }
+
+/* Typography / inputs */
+.h3 { margin: 0; color: #eee; }
+.h4 { margin: 8px 0 4px; color: #ddd; }
+.pre {
+  white-space: pre-wrap;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 12px;
+}
+.preSmall {
+  max-height: 240px;
+  overflow: auto;
+  font-size: 11px;
+}
+.lbl {
+  display: block;
+  font-size: 12px;
+  color: #bbb;
+  margin-top: 8px;
+}
+.input {
+  width: 100%;
+  padding: 6px 8px;
+  border: 1px solid #444;
+  border-radius: 8px;
+  background: #1b1b1b;
+  color: #eee;
+  margin-top: 4px;
+}
+.inputReadonly {
+  width: 100%;
+  padding: 6px 8px;
+  border: 1px solid #444;
+  border-radius: 8px;
+  background: #272727;
+  color: #aaa;
+  margin-top: 4px;
+}
+.select {
+  width: 100%;
+  padding: 6px;
+  border-radius: 8px;
+  background: #1b1b1b;
+  color: #eee;
+  border: 1px solid #555;
+}
+.grid2 {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 8px;
+}
+
+/* zoomed image */
+.zoomWrap { position: absolute; inset: 0; }
+.zoomImg {
+  position: absolute;
+  left: 50%;
+  top: 50%;
+  transform-origin: center center;
+  max-width: 100%;
+  max-height: 100%;
+  user-select: none;
+  pointer-events: none;
+}
+
+/* Responsive tweaks */
+@media (max-width: 1200px) {
+  .modalBody { grid-template-columns: 1.4fr 1fr; }
+  .resultPane { display: none; }
+}
+@media (max-width: 900px) {
+  .rootGrid { grid-template-columns: 1fr; }
+}
+
+
+
