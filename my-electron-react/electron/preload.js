@@ -1,2 +1,6 @@
-import { contextBridge, ipcRenderer } from 'electron'
-contextBridge.exposeInMainWorld('electronAPI', { ping: () => ipcRenderer.invoke('ping') })
+// electron/preload.js
+import { contextBridge, ipcRenderer } from 'electron';
+
+contextBridge.exposeInMainWorld('api', {
+    ping: () => ipcRenderer.invoke('ping'),
+});
