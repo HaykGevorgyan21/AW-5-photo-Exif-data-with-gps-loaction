@@ -1,9 +1,24 @@
 // PixelToMapNoCanvas_sony_static_cam.tsx
-// Tailored for SONY ILCE-5100 static camera metadata (DMS GPS, Orientation=Rotate 90 CW, UserComment LAT/LON/PITCH/ROLL/YAW)
+// Robust EXIF parser for SONY ILCE-5100 (and DJI). Pulls:
+// lat, lon, absolute altitude (AMSL), relative altitude (AGL), ground altitude,
+// yaw/pitch/roll (prefers DJI gimbal/flight keys or your UserComment),
+// FOV (uses EXIF 'FOV', else 35mm equiv, else FocalLength+sensor width,
+// else manual fallback), and handles Orientation “Rotate 90 CW”.
+// Includes auto “opposite sign” fix and AMSL↔AGL linkage.
 
 import React, { useRef, useState } from "react";
 import * as exifr from "exifr";
 import s from "./PixelToMapNoCanvas.module.scss";
+
+// --- small DB of sensor widths (mm) for FOV calc when FocalLength is present ---
+const SENSOR_WIDTH_MM_BY_MODEL: Record<string, number> = {
+    // APS-C Sony (ILCE-5100 et al.)
+    "ILCE-5100": 23.5,
+    "ILCE-6000": 23.5,
+    "ILCE-6100": 23.5,
+    "ILCE-6300": 23.5,
+    "ILCE-6400": 23.5,
+};
 
 export default function PixelToMapNoCanvas({
                                                enableOpenCV = false,
@@ -18,7 +33,6 @@ export default function PixelToMapNoCanvas({
     const [imgH, setImgH] = useState(0);
     const [blobUrl, setBlobUrl] = useState<string | null>(null);
 
-    // zoom & pan (separate refs for preview vs viewer)
     const previewRef = useRef<HTMLDivElement | null>(null);
     const viewerRef = useRef<HTMLDivElement | null>(null);
     const [scale, setScale] = useState(1);
@@ -33,16 +47,17 @@ export default function PixelToMapNoCanvas({
     const [fy, setFy] = useState(0);
     const [cx, setCx] = useState(0);
     const [cy, setCy] = useState(0);
-    const [fovx, setFovx] = useState(63); // deg, sane default for APS-C + ~24-28mm equiv
+    const [fovx, setFovx] = useState(63); // deg fallback if EXIF has nothing usable
 
-    // ------------ pose (AMSL alt; yaw ENU, pitch +down, roll +right) ------------
+    // ------------ pose (AMSL alt; yaw ENU 0=N +CW; pitch +down; roll +right) ------------
     const [lat, setLat] = useState<number>(0);
     const [lon, setLon] = useState<number>(0);
-    const [alt_m, setAlt] = useState<number>(0); // camera AMSL
-    const [yaw, setYaw] = useState<number>(0); // 0=N, +CW
-    const [pitch, setPitch] = useState<number>(0); // +down
-    const [roll, setRoll] = useState<number>(0); // +right
-    const [groundAlt, setGroundAlt] = useState<number>(0); // ground AMSL
+    const [alt_m, setAlt] = useState<number>(0);          // camera AMSL
+    const [yaw, setYaw] = useState<number>(0);            // 0=N, +CW
+    const [pitch, setPitch] = useState<number>(0);        // +down
+    const [roll, setRoll] = useState<number>(0);          // +right
+    const [groundAlt, setGroundAlt] = useState<number>(0);// ground AMSL
+    const [agl, setAgl] = useState<number>(0);            // Height AGL
 
     // ------------ UI / misc ------------
     const [mount, setMount] = useState<"forward" | "nadir">("forward");
@@ -50,8 +65,6 @@ export default function PixelToMapNoCanvas({
     const [out, setOut] = useState("Select image, then click inside…");
     const [metaDump, setMetaDump] = useState<Record<string, any> | null>(null);
     const [orientation, setOrientation] = useState<string>("Horizontal (normal)");
-
-    // modal
     const [viewerOpen, setViewerOpen] = useState(false);
 
     // ------------ math helpers ------------
@@ -61,11 +74,16 @@ export default function PixelToMapNoCanvas({
     function Rz(a: number) { const c = Math.cos(a), s = Math.sin(a); return [[c,-s,0],[s,c,0],[0,0,1]] as number[][]; }
     function matMul(A: number[][], B: number[][]) {
         const R = [[0,0,0],[0,0,0],[0,0,0]] as number[][];
-        for (let i=0;i<3;i++) for (let j=0;j<3;j++) R[i][j] = A[i][0]*B[0][j] + A[i][1]*B[1][j] + A[i][2]*B[2][j];
+        for (let i=0;i<3;i++) for (let j=0;j<3;j++)
+            R[i][j] = A[i][0]*B[0][j] + A[i][1]*B[1][j] + A[i][2]*B[2][j];
         return R;
     }
     function matVec(A: number[][], v: number[]) {
-        return [ A[0][0]*v[0] + A[0][1]*v[1] + A[0][2]*v[2], A[1][0]*v[0] + A[1][1]*v[1] + A[1][2]*v[2], A[2][0]*v[0] + A[2][1]*v[1] + A[2][2]*v[2] ];
+        return [
+            A[0][0]*v[0] + A[0][1]*v[1] + A[0][2]*v[2],
+            A[1][0]*v[0] + A[1][1]*v[1] + A[1][2]*v[2],
+            A[2][0]*v[0] + A[2][1]*v[1] + A[2][2]*v[2],
+        ];
     }
     function normalize(v: number[]) { const n = Math.hypot(v[0], v[1], v[2]) || 1; return [v[0]/n, v[1]/n, v[2]/n]; }
     function metersPerDeg(latDeg: number) {
@@ -79,17 +97,16 @@ export default function PixelToMapNoCanvas({
         return W/2 / Math.max(half, 1e-9);
     }
 
-    // ------------ parsing helpers for SONY/DMS/UserComment ------------
+    // ------------ parsing helpers ------------
     function numberFromMixedString(v: any): number | undefined {
         if (typeof v === "number" && Number.isFinite(v)) return v;
         if (typeof v === "string") {
-            const m = v.match(/-?\d+(?:\.\d+)?/);
+            const m = v.match(/-?\d+(?:\.\d+)?/);  // handles "1313.4 m Above Sea Level"
             if (m) return parseFloat(m[0]);
         }
         return undefined;
     }
     function parseDMSString(str: string): {value: number, ref?: string} | undefined {
-        // Examples: "40 deg 18' 25.20\" N", "44 deg 25' 53.09\" E"
         const rx = /(-?\d+(?:\.\d+)?)\s*(?:deg|°)?\s*(\d+(?:\.\d+)?)?\s*(?:'|m)?\s*(\d+(?:\.\d+)?)?\s*(?:\"|s)?\s*([NSEW])?/i;
         const m = str.match(rx);
         if (!m) return undefined;
@@ -98,12 +115,11 @@ export default function PixelToMapNoCanvas({
         const S = m[3] ? parseFloat(m[3]) : 0;
         const ref = m[4]?.toUpperCase();
         let dec = Math.abs(D) + M/60 + S/3600;
-        if (ref === 'S' || ref === 'W') dec = -dec;
+        if (ref === "S" || ref === "W") dec = -dec;
         if (!ref && D < 0) dec = -dec;
         return { value: dec, ref };
     }
     function toDecimalDegrees(value: any, ref?: string | null): number | undefined {
-        // arrays
         if (Array.isArray(value) && value.length >= 3) {
             const [D,M,S] = value.map(Number);
             if ([D,M,S].every(Number.isFinite)) {
@@ -113,12 +129,11 @@ export default function PixelToMapNoCanvas({
                 return dec;
             }
         }
-        // DMS string
-        if (typeof value === 'string') {
+        if (typeof value === "string") {
             const dms = parseDMSString(value);
             if (dms) return dms.value;
-            if (value.includes(',')) {
-                const parts = value.split(',').map((p) => parseFloat(p.trim()));
+            if (value.includes(",")) {
+                const parts = value.split(",").map((p) => parseFloat(p.trim()));
                 if (parts.length >= 3 && parts.every(Number.isFinite)) {
                     let dec = Math.abs(parts[0]) + parts[1]/60 + parts[2]/3600;
                     if (ref && /[SW]/i.test(ref)) dec = -dec;
@@ -131,53 +146,44 @@ export default function PixelToMapNoCanvas({
         return Number.isFinite(n) ? n : undefined;
     }
     function pickFirst<T = number>(obj: any, keys: string[], convert?: (v: any) => T | undefined): T | undefined {
-        for (const k of keys) if (k in (obj ?? {})) {
+        for (const k of keys) if (obj && k in obj) {
             const v = obj[k];
             const out = convert ? convert(v) : (v as T);
             if (out !== undefined && out !== null && !(Number.isNaN(out as any))) return out;
         }
         return undefined;
     }
-    function fxFrom35mm(W: number, f35mm?: number, fallbackFovxDeg?: number) {
-        if (Number.isFinite(f35mm) && W > 0) return (Number(f35mm) / 36) * W;
-        if (fallbackFovxDeg && W > 0) return fxFromFovX(W, fallbackFovxDeg);
-        return undefined;
-    }
     function parseUserComment(uc: any) {
-        if (typeof uc !== 'string') return {} as any;
+        if (typeof uc !== "string") return {} as any;
         const kv: any = {};
-        // e.g. "Lat=40.30700100 Lon=44.43141260 Pitch=1.70925283 Roll=1.33557141 Yaw=74.06570435"
         const rx = /(Lat|Lon|Pitch|Roll|Yaw)\s*=\s*(-?\d+(?:\.\d+)?)/gi;
         let m: RegExpExecArray | null;
         while ((m = rx.exec(uc)) !== null) kv[m[1].toLowerCase()] = parseFloat(m[2]);
         return kv; // { lat, lon, pitch, roll, yaw }
     }
 
-    // ------------ orientation handling (display → sensor coords) ------------
+    // ------------ Orientation → convert display u,v to sensor u,v ------------
     function uvDisplayToSensor(u: number, v: number) {
-        // The browser usually auto-rotates image by EXIF Orientation.
-        // We bring (u,v) from displayed coords back to the original sensor orientation
-        // so that intrinsics (cx,cy,fx,fy) defined on raw image make sense.
-        switch ((orientation || '').toLowerCase()) {
-            case 'rotate 90 cw':
-            case 'right-top': // some EXIF libs
-            case '6':
+        switch ((orientation || "").toLowerCase()) {
+            case "rotate 90 cw":
+            case "right-top":
+            case "6":
                 return { u: v, v: imgW - u };
-            case 'rotate 270 cw':
-            case 'left-bottom':
-            case '8':
+            case "rotate 270 cw":
+            case "left-bottom":
+            case "8":
                 return { u: imgH - v, v: u };
-            case 'rotate 180':
-            case 'bottom-right':
-            case '3':
+            case "rotate 180":
+            case "bottom-right":
+            case "3":
                 return { u: imgW - u, v: imgH - v };
-            default: // 'horizontal (normal)', '1'
+            default: // Horizontal (normal)
                 return { u, v };
         }
     }
 
-    // ------------ projection ENU ------------
-    function project(uDisp: number, vDisp: number) {
+    // ------------ ENU projection to ground ------------
+    function project(uDisp: number, vDisp: number, opts?: { returnDz?: boolean }) {
         const { u, v } = uvDisplayToSensor(uDisp, vDisp);
 
         const _fx = Number.isFinite(fx) && fx !== 0 ? fx : fxFromFovX(imgW, fovx);
@@ -188,26 +194,64 @@ export default function PixelToMapNoCanvas({
         const baseLat = Number.isFinite(lat) ? lat : 0;
         const baseLon = Number.isFinite(lon) ? lon : 0;
 
-        // body from ENU with yaw→pitch→roll
         const R_enu_body = matMul(Rz(deg2rad(yaw || 0)), matMul(Ry(deg2rad(pitch || 0)), Rx(deg2rad(roll || 0))));
-        // camera relative to body
         const R_body_cam = mount === "nadir" ? Rx(deg2rad(-90)) : ([[1,0,0],[0,1,0],[0,0,1]] as number[][]);
-        const R_enu_cam = matMul(R_enu_body, R_body_cam as number[][]);
+        const R_enu_cam = matMul(R_enu_body, R_body_cam);
 
         function trySolve(zSign: number) {
             const x = (u - _cx) / _fx, y = (v - _cy) / _fy;
             const d_cam = normalize([x, y, zSign]);
             const d_enu = matVec(R_enu_cam, d_cam);
             const dz = d_enu[2];
+            if (opts?.returnDz) return dz;
             if (Math.abs(dz) < 1e-9) return null;
-            // alt_m & groundAlt must be AMSL
             const t = ((groundAlt || 0) - (alt_m || 0)) / dz;
-            if (t < 0) return null; // ray goes upward / behind
+            if (t < 0) return null; // up/behind
             const xE = t * d_enu[0], yN = t * d_enu[1];
             const { mlat, mlon } = metersPerDeg(baseLat);
-            return { lat: baseLat + yN / mlat, lon: baseLon + xE / mlon };
+            return { lat: baseLat + yN / mlat, lon: baseLon + xE / mlon, range: Math.hypot(xE, yN) };
         }
         return trySolve(+1) ?? trySolve(-1);
+    }
+
+    // ------------ Auto-fix “opposites” ------------
+    function autoFixPose() {
+        if (!imgW || !imgH) return;
+        const u0 = imgW/2, v0 = imgH/2;
+
+        type Conf = { pitch:number; roll:number; yaw:number; mount:"forward"|"nadir"; score:number; };
+        const cand: Conf[] = [];
+        const yawVars = [ yaw, -yaw ];
+        const pitchVars = [ pitch, -pitch ];
+        const rollVars = [ roll, -roll ];
+        const mounts: Array<"forward"|"nadir"> = [ "forward", "nadir" ];
+
+        for (const yv of yawVars)
+            for (const pv of pitchVars)
+                for (const rv of rollVars)
+                    for (const m of mounts) {
+                        const bak = { yaw, pitch, roll, mount };
+                        setYaw(yv); setPitch(pv); setRoll(rv); setMount(m);
+                        const hit = project(u0, v0) as any;
+                        let score = Number.POSITIVE_INFINITY;
+                        if (hit) {
+                            const dzPlus  = project(u0, v0, { returnDz: true }) as any;
+                            const dz = Math.abs(dzPlus ?? 0);
+                            const dist = Math.max(1, hit.range || 1);
+                            score = dist + (1/(dz+1e-6))*50; // heuristic
+                        }
+                        cand.push({ pitch: pv, roll: rv, yaw: yv, mount: m, score });
+                        setYaw(bak.yaw); setPitch(bak.pitch); setRoll(bak.roll); setMount(bak.mount);
+                    }
+
+        cand.sort((a,b)=>a.score-b.score);
+        const best = cand[0];
+        if (!isFinite(best.score)) {
+            setOut("Auto-fix: no valid ground intersection. Check AMSL/AGL.");
+            return;
+        }
+        setYaw(best.yaw); setPitch(best.pitch); setRoll(best.roll); setMount(best.mount);
+        setOut(`Auto-fix → yaw=${best.yaw.toFixed(3)}  pitch=${best.pitch.toFixed(3)}  roll=${best.roll.toFixed(3)}  mount=${best.mount}`);
     }
 
     // ------------ file load + metadata parse ------------
@@ -223,59 +267,184 @@ export default function PixelToMapNoCanvas({
             setImgH(img.naturalHeight);
             setCx(img.naturalWidth / 2);
             setCy(img.naturalHeight / 2);
-            // reset view
             setScale(1); setTx(0); setTy(0);
 
             try {
-                const meta: any = await exifr.parse(f, { xmp: true, icc: false, tiff: true, jfif: true, ihdr: true });
-                setMetaDump(meta ?? {});
+                             // naxkin kode usercommenty cher parse anum
 
-                // ---- Orientation ----
-                const ori = meta.Orientation ?? meta["IFD0:Orientation"] ?? meta["orientation"]; // e.g. "Rotate 90 CW" or 6
-                setOrientation(String(ori ?? 'Horizontal (normal)'));
+                // const meta: any = await exifr.parse(f, { xmp: true, icc: false, tiff: true, jfif: true, ihdr: true });
+                // setMetaDump(meta ?? {});
 
-                // ---- Lat/Lon priority: UserComment > GPS DMS fields ----
+
+
+                const meta: any = await exifr.parse(f, {
+                    xmp: true,
+                    icc: false,
+                    tiff: true,
+                    jfif: true,
+                    ihdr: true,
+                    userComment: true,
+                    makerNote: true,      // <—— սա թույլ է տալիս կարդալ Sony MakerNotes-ը
+                    multiSegment: true,   // <—— երբեմն SONY UserComment-ը լինում է երկրորդ սեգմենտում
+                });
+                console.log("=== EXIF RAW METADATA ===", meta);
+                console.log("UserComment raw:", meta.UserComment);
+
+
+                console.log("=== EXIF RAW METADATA ===", meta);
+                console.log("UserComment raw:", meta.UserComment);
+                if (meta.UserComment instanceof Uint8Array) {
+                    const ucText = new TextDecoder("utf-8").decode(meta.UserComment);
+                    console.log("UserComment decoded:", ucText);
+                }
+
+
+                console.log(Object.keys(meta), 'testtttttttttttttt');
+
+                // --- Decode Sony UserComment safely (works for ILCE-5100) ---
+                let userComment = "";
+
+// Sony sometimes stores UserComment as a byte array, not a string
+                const ucRaw =
+                    meta.UserComment ??
+                    meta.userComment ??
+                    meta["User Comment"] ??
+                    meta.makerNote;
+
+                if (ucRaw) {
+                    if (typeof ucRaw === "string") {
+                        userComment = ucRaw;
+                    } else if (ucRaw instanceof Uint8Array || Array.isArray(ucRaw)) {
+                        // Convert byte array to readable text
+                        try {
+                            const bytes = Array.from(ucRaw as any);
+                            // Drop ASCII header if present (65,83,67,73,73 = "ASCII")
+                            const asciiIndex = bytes.join(",").indexOf("65,83,67,73,73");
+                            const cleanBytes =
+                                asciiIndex >= 0 ? bytes.slice(asciiIndex + 8) : bytes;
+                            userComment = new TextDecoder("ascii").decode(
+                                new Uint8Array(cleanBytes)
+                            );
+                        } catch {
+                            userComment = "";
+                        }
+                    }
+                }
+
+                console.log("Decoded UserComment text:", userComment);
+
+// Extract Pitch / Roll / Yaw numbers
+                const kv: any = {};
+                const rx = /(Lat|Lon|Pitch|Roll|Yaw)\s*=\s*(-?\d+(?:\.\d+)?)/gi;
+                let m: RegExpExecArray | null;
+                while ((m = rx.exec(userComment)) !== null)
+                    kv[m[1].toLowerCase()] = parseFloat(m[2]);
+
+                if (Number.isFinite(kv.pitch)) setPitch(kv.pitch);
+                if (Number.isFinite(kv.roll))  setRoll(kv.roll);
+                if (Number.isFinite(kv.yaw))   setYaw(kv.yaw);
+
+
+                // Orientation: prefer CameraOrientation for Sony if present
+                const ori =
+                    meta.CameraOrientation ??
+                    meta.Orientation ??
+                    meta["IFD0:Orientation"] ??
+                    meta["orientation"];
+                setOrientation(String(ori ?? "Horizontal (normal)"));
+
+                // UserComment (your format)
+                // const uc = String(meta.UserComment || meta.usercomment || "");
                 const uc = String(meta.UserComment || meta.usercomment || "");
-                const kc = parseUserComment(uc);
 
-                const latRef = meta.GPSLatitudeRef ?? meta.gpslatituderef ?? null;
-                const lonRef = meta.GPSLongitudeRef ?? meta.gpslongituderef ?? null;
-                const mLat = kc.lat ?? pickFirst<number>(meta, ["GPSLatitude", "latitude"], (v) => toDecimalDegrees(v, latRef));
-                const mLon = kc.lon ?? pickFirst<number>(meta, ["GPSLongitude", "longitude"], (v) => toDecimalDegrees(v, lonRef));
+                const kc = parseUserComment(uc); // {lat, lon, pitch, roll, yaw?}
+
+                // Latitude/Longitude
+                const latRef = meta.GPSLatitudeRef ?? meta.gpslatituderef ?? "N";
+                const lonRef = meta.GPSLongitudeRef ?? meta.gpslongituderef ?? "E";
+                const mLat = kc.lat ?? pickFirst<number>(meta, ["GPSLatitude", "latitude"], (v)=>toDecimalDegrees(v, latRef));
+                const mLon = kc.lon ?? pickFirst<number>(meta, ["GPSLongitude", "longitude"], (v)=>toDecimalDegrees(v, lonRef));
                 if (Number.isFinite(mLat)) setLat(mLat as number);
                 if (Number.isFinite(mLon)) setLon(mLon as number);
 
-                // ---- Altitude (AMSL preferred) ----
-                const gpsAltMixed = pickFirst<any>(meta, ["GPSAltitude", "altitude"], (v)=>v);
-                const gpsAlt = numberFromMixedString(gpsAltMixed);
-                const altRef = meta.GPSAltitudeRef; // Above/Below Sea Level
-                const gpsAltSigned = Number.isFinite(gpsAlt)
-                    ? (String(altRef).toLowerCase().includes("below") ? -Number(gpsAlt) : Number(gpsAlt))
-                    : undefined;
-                let useAlt: number | undefined = gpsAltSigned;
-                if (Number.isFinite(useAlt)) setAlt(useAlt!);
-                // Initialize groundAlt to alt-2 m (adjust in UI)
-                if (Number.isFinite(useAlt) && !Number.isFinite(groundAlt)) setGroundAlt((useAlt as number) - 2);
+                // Absolute altitude (AMSL) and RelativeAltitude (DJI) → AGL
+                const absAltPref =
+                    numberFromMixedString(pickFirst(meta, ["AbsoluteAltitude"])) ??
+                    numberFromMixedString(pickFirst(meta, ["GPSAltitude", "altitude"]));
+                const relAlt = numberFromMixedString(pickFirst(meta, ["RelativeAltitude"]));
 
-                // ---- Attitude: prefer UserComment Pitch/Roll/Yaw if present ----
-                if (Number.isFinite(kc.yaw)) setYaw(kc.yaw);
-                if (Number.isFinite(kc.pitch)) setPitch(kc.pitch); // assumes +down in your pipeline
-                if (Number.isFinite(kc.roll)) setRoll(kc.roll);
+                if (Number.isFinite(absAltPref)) setAlt(absAltPref as number);
+                if (Number.isFinite(relAlt)) {
+                    setAgl(relAlt as number);
+                    if (Number.isFinite(absAltPref)) setGroundAlt((absAltPref as number) - (relAlt as number));
+                } else {
+                    // no AGL in EXIF → keep previous or default 2 m
+                    const initAGL = (agl && agl>0) ? agl : 2;
+                    setAgl(initAGL);
+                    if (Number.isFinite(absAltPref)) setGroundAlt((absAltPref as number) - initAGL);
+                }
 
-                // ---- Intrinsics fx/fy from 35mm equivalence or FOV ----
-                const f35 = pickFirst<number>(meta, ["FocalLengthIn35mmFormat", "ExifIFD:FocalLengthIn35mmFilm"], Number);
-                const by35 = fxFrom35mm(img.naturalWidth, f35, fovx);
-                const byFov = fxFromFovX(img.naturalWidth, fovx || 63);
-                const fxUse = Number.isFinite(by35) ? (by35 as number) : byFov;
-                setFx(fxUse); setFy(fxUse);
+                // Attitude (prefer DJI keys; else Sony UserComment)
+                const yawPref =
+                    numberFromMixedString(pickFirst(meta, ["GimbalYawDegree","FlightYawDegree","CameraYaw","Yaw"])) ??
+                    kc.yaw;
+                const pitchPref =
+                    numberFromMixedString(pickFirst(meta, ["GimbalPitchDegree","FlightPitchDegree","CameraPitch","Pitch"])) ??
+                    kc.pitch;  // we treat +down
+                const rollPref =
+                    numberFromMixedString(pickFirst(meta, ["GimbalRollDegree","FlightRollDegree","CameraRoll","Roll"])) ??
+                    kc.roll;   // +right
+
+                if (Number.isFinite(yawPref))   setYaw(yawPref as number);
+                if (Number.isFinite(pitchPref)) setPitch(pitchPref as number);
+                if (Number.isFinite(rollPref))  setRoll(rollPref as number);
+
+                // ------ FOV / intrinsics ------
+                // 1) Use explicit FOV if present (DJI “FOV: 84.0 deg” or XMP)
+                let fovxDeg =
+                    numberFromMixedString(pickFirst(meta, ["FOV","HFOV","HorizontalFOV"])) ??
+                    undefined;
+
+                // 2) Else, use 35mm equivalent (FocalLengthIn35mmFormat) if >0
+                if (!Number.isFinite(fovxDeg)) {
+                    const f35 = numberFromMixedString(
+                        pickFirst(meta, ["FocalLengthIn35mmFormat","ExifIFD:FocalLengthIn35mmFilm"])
+                    );
+                    if (Number.isFinite(f35) && (f35 as number) > 0) {
+                        // fx(px) = (f35/36) * Wpx
+                        const fx35 = (Number(f35) / 36) * img.naturalWidth;
+                        setFx(fx35); setFy(fx35);
+                    }
+                }
+
+                // 3) Else, use FocalLength (mm) + sensor width for known bodies
+                if ((!fx || !fy) || (fx===0 && fy===0)) {
+                    const fmm = numberFromMixedString(pickFirst(meta, ["FocalLength"]));
+                    const model = String(meta.Model || "");
+                    const sensorW = SENSOR_WIDTH_MM_BY_MODEL[model] ?? undefined;
+                    if (Number.isFinite(fmm) && (fmm as number) > 0 && Number.isFinite(sensorW)) {
+                        const f = Number(fmm);
+                        const sw = Number(sensorW);
+                        fovxDeg = 2 * (180/Math.PI) * Math.atan((sw/2) / f);
+                        // convert to fx pixels
+                        const _fx = fxFromFovX(img.naturalWidth, fovxDeg);
+                        setFx(_fx); setFy(_fx);
+                    }
+                }
+
+                // 4) If still nothing usable, keep your manual FOVx fallback
+                if ((!fx || !fy) || (fx===0 && fy===0)) {
+                    const _fx = fxFromFovX(img.naturalWidth, fovx || 63);
+                    setFx(_fx); setFy(_fx);
+                }
                 if (!Number.isFinite(cx) || !cx) setCx(img.naturalWidth / 2);
                 if (!Number.isFinite(cy) || !cy) setCy(img.naturalHeight / 2);
 
-                setOut("SONY/Static-camera metadata applied. Click the image to compute ground point.");
+                setOut("Metadata parsed. Click the image to compute ground point.");
             } catch (e) {
                 const _fx = fxFromFovX(img.naturalWidth, fovx || 63);
                 setFx(_fx); setFy(_fx); setCx(img.naturalWidth/2); setCy(img.naturalHeight/2);
-                setOut("No readable metadata. Using FOVx fallback. Fill pose/alt/groundAlt and click on image.");
+                setOut("No readable metadata. Using FOVx fallback. Fill pose/alt/groundAlt (or AGL) and click on image.");
             }
         };
         img.src = url;
@@ -295,7 +464,7 @@ export default function PixelToMapNoCanvas({
         return { contW, contH, baseS, S, drawW, drawH, offX, offY };
     }
 
-    // ------------ image interactions (VIEWER ONLY) ------------
+    // ------------ image interactions ------------
     function pickUV(e: React.MouseEvent, which: "preview" | "viewer") {
         if (!imgEl) return null;
         const host = which === "preview" ? previewRef.current : viewerRef.current;
@@ -352,15 +521,24 @@ export default function PixelToMapNoCanvas({
         const uv = pickUV(e, "viewer");
         if (!uv) { setOut("Click is outside image."); return; }
         if (!Number.isFinite(lat) || !Number.isFinite(lon)) { setOut("No GPS in metadata. Fill Latitude/Longitude first."); return; }
-        if (!Number.isFinite(alt_m) || !Number.isFinite(groundAlt)) { setOut("Set both Ground Alt (AMSL) and Altitude (AMSL)."); return; }
 
-        const hit = project(uv.u, uv.v);
-        if (!hit) { setOut("Ray didn’t hit the ground plane (up/behind). Check mount/pitch and AMSL vs AGL."); return; }
+        // AMSL/AGL linkage
+        if (Number.isFinite(alt_m) && Number.isFinite(agl)) {
+            setGroundAlt(alt_m - agl);
+        }
+
+        if (!Number.isFinite(alt_m) || !Number.isFinite(groundAlt)) {
+            setOut("Set Altitude (AMSL) and either Ground Alt (AMSL) or Height AGL.");
+            return;
+        }
+
+        const hit = project(uv.u, uv.v) as any;
+        if (!hit) { setOut("Ray didn’t hit the ground plane (up/behind). Try Auto-fix pose or check AMSL/AGL."); return; }
         setOut([
             `Pixel (${uv.u.toFixed(1)}, ${uv.v.toFixed(1)})`,
             `Lat: ${hit.lat.toFixed(7)}`,
             `Lon: ${hit.lon.toFixed(7)}`,
-            `groundAlt=${Number(groundAlt).toFixed(2)} m; alt=${Number(alt_m).toFixed(2)} m`,
+            `groundAlt=${Number(groundAlt).toFixed(2)} m; alt=${Number(alt_m).toFixed(2)} m; AGL=${(alt_m - groundAlt).toFixed(2)} m`,
             `yaw=${Number(yaw).toFixed(2)}°, pitch=${Number(pitch).toFixed(2)}°, roll=${Number(roll).toFixed(2)}°`,
             `fx=${Number(fx).toFixed(2)}, fy=${Number(fy).toFixed(2)}, cx=${Number(cx).toFixed(2)}, cy=${Number(cy).toFixed(2)}`,
             `mount: ${mount}; orientation: ${orientation}`,
@@ -368,17 +546,21 @@ export default function PixelToMapNoCanvas({
     };
     const onDoubleClick: React.MouseEventHandler<HTMLDivElement> = () => { setScale(1); setTx(0); setTy(0); };
 
-    // ---- render blocks reused (compact vs viewer) ----
+    // ------------ UI blocks ------------
     const PoseIntrinsicsBlock = (
         <>
             <h3 className={s.h3}>Pose</h3>
             {num("Latitude (°)", lat, setLat, 1e-7)}
             {num("Longitude (°)", lon, setLon, 1e-7)}
-            {num("Altitude (m, AMSL)", alt_m, setAlt, 0.01)}
+            {num("Altitude (m, AMSL)", alt_m, (v)=>{ setAlt(v); setGroundAlt(v - agl); })}
+            <div className={s.grid2}>
+                {num("Ground Alt (m, AMSL)", groundAlt, (v)=>{ setGroundAlt(v); setAgl(alt_m - v); })}
+                {num("Height AGL (m)", agl, (v)=>{ setAgl(v); setGroundAlt(alt_m - v); })}
+            </div>
             {num("Yaw (°)", yaw, setYaw, 0.01)}
             {num("Pitch (°, +down)", pitch, setPitch, 0.01)}
             {num("Roll (°, +right)", roll, setRoll, 0.01)}
-            {num("Ground Alt (m, AMSL)", groundAlt, setGroundAlt, 0.01)}
+            <button className={s.btn} onClick={autoFixPose}>Auto-fix pose</button>
 
             <h3 className={s.h3}>Intrinsics</h3>
             <div className={s.grid2}>
@@ -390,14 +572,15 @@ export default function PixelToMapNoCanvas({
                 {num("cy (px)", cy, setCy, 0.01)}
             </div>
             {num("FOVx (°) → auto fx/fy", fovx, setFovx, 0.01)}
-            <button className={s.btn} onClick={() => {
-                if (!imgW) return; const _fx = fxFromFovX(imgW, fovx || 63);
+            <button className={s.btn} onClick={()=>{
+                if (!imgW) return;
+                const _fx = fxFromFovX(imgW, fovx || 63);
                 setFx(_fx); setFy(_fx); setCx(imgW/2); setCy(imgH/2);
                 setOut("Intrinsics updated from FOVx.");
             }}>Apply intrinsics</button>
 
             <h3 className={s.h3}>Mount & Orientation</h3>
-            <select value={mount} onChange={(e) => setMount(e.target.value as any)} className={s.select}>
+            <select value={mount} onChange={(e)=>setMount(e.target.value as any)} className={s.select}>
                 <option value="forward">Forward (z along heading)</option>
                 <option value="nadir">Down (nadir)</option>
             </select>
@@ -418,9 +601,23 @@ export default function PixelToMapNoCanvas({
             GPSLongitude: metaDump.GPSLongitude,
             GPSAltitude: metaDump.GPSAltitude,
             GPSAltitudeRef: metaDump.GPSAltitudeRef,
-            UserComment: metaDump.UserComment,
-            Make: metaDump.Make,
+            AbsoluteAltitude: metaDump.AbsoluteAltitude,
+            RelativeAltitude: metaDump.RelativeAltitude,
+            GimbalYawDegree: metaDump.GimbalYawDegree,
+            GimbalPitchDegree: metaDump.GimbalPitchDegree,
+            GimbalRollDegree: metaDump.GimbalRollDegree,
+            FlightYawDegree: metaDump.FlightYawDegree,
+            FlightPitchDegree: metaDump.FlightPitchDegree,
+            FlightRollDegree: metaDump.FlightRollDegree,
+            CameraYaw: metaDump.CameraYaw,
+            CameraPitch: metaDump.CameraPitch,
+            CameraRoll: metaDump.CameraRoll,
+            FOV: metaDump.FOV,
+            FocalLength: metaDump.FocalLength,
+            FocalLengthIn35mmFormat: metaDump.FocalLengthIn35mmFormat,
             Model: metaDump.Model,
+            Make: metaDump.Make,
+            UserComment: metaDump.UserComment,
             ExifImageWidth: metaDump.ExifImageWidth,
             ExifImageHeight: metaDump.ExifImageHeight,
         }, null, 2) : "—"}
@@ -428,18 +625,20 @@ export default function PixelToMapNoCanvas({
         </>
     );
 
-    // ------------ UI ------------
     return (
         <>
             <div className={s.rootGrid}>
-                {/* Left (preview) */}
+                {/* Left */}
                 <div className={s.panel}>
                     <div className={s.dropzone}>
-                        <input type="file" accept="image/*" onChange={(e) => { const f = e.target.files?.[0]; if (f) loadFile(f); }} />
+                        <input type="file" accept="image/*"
+                               onChange={(e)=>{ const f = e.target.files?.[0]; if (f) loadFile(f); }} />
                         <div className={s.dropHint}>Load Image (EXIF auto-parse)</div>
                     </div>
 
-                    <div ref={previewRef} className={s.preview} onClick={() => blobUrl && setViewerOpen(true)} title={blobUrl ? "Open large viewer" : "Load an image first"}>
+                    <div ref={previewRef} className={s.preview}
+                         onClick={()=>blobUrl && setViewerOpen(true)}
+                         title={blobUrl ? "Open large viewer" : "Load an image first"}>
                         {blobUrl && (<>
                             <ZoomedImage src={blobUrl} imgW={imgW} imgH={imgH} scale={1} tx={0} ty={0} />
                             <div className={s.previewOverlay}>Click to open viewer</div>
@@ -448,40 +647,43 @@ export default function PixelToMapNoCanvas({
                     <div className={s.monoDim}>zoom: preview</div>
                 </div>
 
-                {/* Middle (pose/intrinsics quick) */}
+                {/* Middle */}
                 <div className={s.panel}>{PoseIntrinsicsBlock}</div>
 
-                {/* Right (result quick) */}
+                {/* Right */}
                 <div className={s.panel}>{ResultBlock}</div>
             </div>
 
             {/* ===== Modal Viewer ===== */}
             {viewerOpen && (
-                <div role="dialog" aria-modal="true" className={s.modal} onKeyDown={(e) => { if (e.key === "Escape") setViewerOpen(false); }}>
+                <div role="dialog" aria-modal="true" className={s.modal}
+                     onKeyDown={(e)=>{ if (e.key === "Escape") setViewerOpen(false); }}>
                     <div className={s.modalCard}>
-                        {/* header */}
                         <div className={s.modalHeader}>
                             <div className={s.title}>Image Viewer</div>
                             <div className={s.headerBtns}>
-                                <button onClick={() => { setScale(1); setTx(0); setTy(0); }} className={s.btn}>Reset</button>
-                                <button onClick={() => setViewerOpen(false)} className={s.btn}>Close (Esc)</button>
+                                <button onClick={()=>{ setScale(1); setTx(0); setTy(0); }} className={s.btn}>Reset</button>
+                                <button onClick={()=>setViewerOpen(false)} className={s.btn}>Close (Esc)</button>
                             </div>
                         </div>
 
-                        {/* body */}
                         <div className={s.modalBody}>
-                            {/* big image with full interactions */}
                             <div className={s.imagePane}>
-                                <div ref={viewerRef} className={`${s.viewer} ${panning ? s.grabbing : s.crosshair}`} onMouseMove={onMove} onMouseDown={onMouseDown} onMouseUp={onMouseUp} onMouseLeave={onMouseLeave} onWheel={onWheel} onClick={onClickCompute} onDoubleClick={onDoubleClick}>
+                                <div ref={viewerRef}
+                                     className={`${s.viewer} ${panning ? s.grabbing : s.crosshair}`}
+                                     onMouseMove={onMove}
+                                     onMouseDown={onMouseDown}
+                                     onMouseUp={onMouseUp}
+                                     onMouseLeave={onMouseLeave}
+                                     onWheel={onWheel}
+                                     onClick={onClickCompute}
+                                     onDoubleClick={onDoubleClick}>
                                     {blobUrl && <ZoomedImage src={blobUrl} imgW={imgW} imgH={imgH} scale={scale} tx={tx} ty={ty} />}
                                 </div>
                                 <div className={s.monoBright}>{pixelStr} · zoom: {scale.toFixed(2)}</div>
                             </div>
 
-                            {/* middle (full controls) */}
                             <div className={s.infoPane}>{PoseIntrinsicsBlock}</div>
-
-                            {/* right (result) */}
                             <div className={s.resultPane}>{ResultBlock}</div>
                         </div>
                     </div>
@@ -496,7 +698,8 @@ function num(label: string, value: number, set: (v: number) => void, step: numbe
     return (
         <label className={s.lbl}>
             {label}
-            <input type="number" step={step} value={Number.isFinite(value) ? value : 0} onChange={(e) => set(parseFloat(e.target.value))} className={s.input} />
+            <input type="number" step={step} value={Number.isFinite(value) ? value : 0}
+                   onChange={(e)=>set(parseFloat(e.target.value))} className={s.input} />
         </label>
     );
 }
@@ -510,13 +713,13 @@ function readonly(label: string, value: number | string) {
 }
 
 // ---- image with CSS transform for visual zoom/pan ----
-function ZoomedImage({ src, imgW, imgH, scale, tx, ty }: { src: string; imgW: number; imgH: number; scale: number; tx: number; ty: number }) {
+function ZoomedImage({ src, imgW, imgH, scale, tx, ty }:
+                         { src:string; imgW:number; imgH:number; scale:number; tx:number; ty:number }) {
     return (
         <div className={s.zoomWrap}>
-            <img src={src} alt="loaded" draggable={false} className={s.zoomImg} style={{ transform: `translate(-50%, -50%) translate(${tx}px, ${ty}px) scale(${scale})` }} />
+            <img src={src} alt="loaded" draggable={false}
+                 className={s.zoomImg}
+                 style={{ transform: `translate(-50%, -50%) translate(${tx}px, ${ty}px) scale(${scale})` }} />
         </div>
     );
 }
-
-// ---- tiny style helper ----
-export const btnStyle: React.CSSProperties = {};
