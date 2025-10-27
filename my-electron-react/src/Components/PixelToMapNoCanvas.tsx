@@ -20,6 +20,18 @@ const SENSOR_WIDTH_MM_BY_MODEL: Record<string, number> = {
     "ILCE-6400": 23.5,
 };
 
+type HitPoint = {
+    id: number;
+    name: string;
+    pixelU: number;
+    pixelV: number;
+    lat: number;
+    lon: number;
+    altAMSL: number; // we’ll store camera AMSL for reference
+    groundAltAMSL: number;
+    agl: number;
+};
+
 export default function PixelToMapNoCanvas({
                                                enableOpenCV = false, // kept for API compatibility; unused here
                                                opencvUrl = "/opencv/opencv.js",
@@ -66,6 +78,10 @@ export default function PixelToMapNoCanvas({
     const [orientation, setOrientation] = useState<string>("Horizontal (normal)");
     const [viewerOpen, setViewerOpen] = useState(false);
 
+    // --- clicked points (for KML export) ---
+    const [points, setPoints] = useState<HitPoint[]>([]);
+    const [nameCounter, setNameCounter] = useState(1);
+
     // ------------ math helpers ------------
     const deg2rad = (d: number) => (d * Math.PI) / 180;
     function Rx(a: number) { const c = Math.cos(a), s = Math.sin(a); return [[1,0,0],[0,c,-s],[0,s,c]] as number[][]; }
@@ -94,6 +110,74 @@ export default function PixelToMapNoCanvas({
     function fxFromFovX(W: number, fovx_deg: number) {
         const half = Math.tan(deg2rad((fovx_deg || 1e-6)/2));
         return W/2 / Math.max(half, 1e-9);
+    }
+
+    // ------------ formatting helpers (for Google Earth & DMS) ------------
+    function toDMS(value: number, isLat: boolean) {
+        const hemi = isLat ? (value >= 0 ? "N" : "S") : (value >= 0 ? "E" : "W");
+        const abs = Math.abs(value);
+        const D = Math.floor(abs);
+        const Mfull = (abs - D) * 60;
+        const M = Math.floor(Mfull);
+        const S = (Mfull - M) * 60;
+        return `${D}° ${M}' ${S.toFixed(3)}" ${hemi}`;
+    }
+    function toGoogleEarthCoord(lon: number, lat: number, altAMSL?: number) {
+        // KML uses "lon,lat,alt" with meters AMSL (or omit alt + clampToGround)
+        if (Number.isFinite(altAMSL)) return `${lon.toFixed(7)},${lat.toFixed(7)},${Number(altAMSL).toFixed(2)}`;
+        return `${lon.toFixed(7)},${lat.toFixed(7)}`;
+    }
+    function buildKML(points: HitPoint[]) {
+        const header = `<?xml version="1.0" encoding="UTF-8"?>
+<kml xmlns="http://www.opengis.net/kml/2.2">
+  <Document>
+    <name>AW Points</name>
+`;
+        const footer = `  </Document>
+</kml>`;
+        const body = points.map(p => {
+            const coord = toGoogleEarthCoord(p.lon, p.lat, p.groundAltAMSL /* ground AMSL as point alt */);
+            return `    <Placemark>
+      <name>${escapeXml(p.name)}</name>
+      <description><![CDATA[
+        Pixel: (${Math.round(p.pixelU)}, ${Math.round(p.pixelV)})<br/>
+        Lat: ${p.lat.toFixed(7)}<br/>
+        Lon: ${p.lon.toFixed(7)}<br/>
+        Ground AMSL: ${p.groundAltAMSL.toFixed(2)} m<br/>
+        AGL: ${p.agl.toFixed(2)} m
+      ]]></description>
+      <styleUrl>#awPoint</styleUrl>
+      <Point>
+        <altitudeMode>absolute</altitudeMode>
+        <coordinates>${coord}</coordinates>
+      </Point>
+    </Placemark>`;
+        }).join("\n");
+        const style = `    <Style id="awPoint">
+      <IconStyle>
+        <scale>1.2</scale>
+        <Icon><href>http://maps.google.com/mapfiles/kml/paddle/red-circle.png</href></Icon>
+      </IconStyle>
+    </Style>
+`;
+        return header + style + body + "\n" + footer;
+    }
+    function escapeXml(s: string) {
+        return s.replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;").replace(/"/g,"&quot;").replace(/'/g,"&apos;");
+    }
+    async function copy(text: string) {
+        try { await navigator.clipboard.writeText(text); setOut(prev => prev + `\nCopied.`); }
+        catch { /* ignore */ }
+    }
+    function download(filename: string, content: string, mime = "application/vnd.google-earth.kml+xml") {
+        const blob = new Blob([content], { type: mime });
+        const url = URL.createObjectURL(blob);
+        const a = document.createElement("a");
+        a.href = url; a.download = filename;
+        document.body.appendChild(a);
+        a.click();
+        a.remove();
+        URL.revokeObjectURL(url);
     }
 
     // ------------ parsing helpers ------------
@@ -182,9 +266,7 @@ export default function PixelToMapNoCanvas({
     }
 
     // ------------ ENU projection to ground (STATIC NADIR) ------------
-    // Camera basis at nadir (no yaw/pitch/roll):
     // x_cam→East, y_cam→South, z_cam→Down. So pixel +u→East, +v→South.
-    // Apply yaw (around Up), then pitch(+down) and roll(+right) as small tilts.
     function project(uDisp: number, vDisp: number) {
         const { u, v } = uvDisplayToSensor(uDisp, vDisp);
 
@@ -196,31 +278,26 @@ export default function PixelToMapNoCanvas({
         const baseLat = Number.isFinite(lat) ? lat : 0;
         const baseLon = Number.isFinite(lon) ? lon : 0;
 
-        // Base R that maps camera vector → ENU at perfect nadir, yaw=0
-        // Columns are ENU axes of (x_cam, y_cam, z_cam):
-        // x_cam(East)=[1,0,0], y_cam(South)=[0,-1,0], z_cam(Down)=[0,0,-1]
+        // Base mapping camera→ENU at nadir
         const R_base = [
             [ 1,  0,  0],
             [ 0, -1,  0],
             [ 0,  0, -1],
         ] as number[][];
 
-        // Apply yaw about Up (ENU z), then tilt by pitch(+down) about ENU x? and roll(+right) about ENU y?
-        // Practically, body tilts are small; a good stable approximation is to rotate the camera frame
-        // by yaw(pivot Up), then pitch about East(+down), then roll about North(+right):
+        // yaw about Up, then pitch(+down) about East, roll(+right) about North
         const R_yaw   = Rz( deg2rad(yaw || 0) );
-        const R_pitch = Rx( deg2rad(pitch || 0) ); // +down ≈ rotate forward/down around East (x)
-        const R_roll  = Ry( deg2rad(-roll || 0) ); // +right ≈ rotate around North (y), sign chosen to match screen right
-
+        const R_pitch = Rx( deg2rad(pitch || 0) );
+        const R_roll  = Ry( deg2rad(-roll || 0) );
         const R_enu_cam = matMul(R_yaw, matMul(R_pitch, matMul(R_roll, R_base)));
 
-        // Pinhole ray in camera coords (z_cam forward is Down here)
+        // pinhole
         const x = (u - _cx) / _fx;
         const y = (v - _cy) / _fy;
-        const d_cam = normalize([x, y, 1]); // points mostly Down
+        const d_cam = normalize([x, y, 1]); // forward is Down
         const d_enu = matVec(R_enu_cam, d_cam); // ENU ray
 
-        const dz = d_enu[2]; // Up component; for nadir ray dz should be negative
+        const dz = d_enu[2]; // Up component (nadir → negative)
         if (Math.abs(dz) < 1e-12) return null;
 
         const camAlt = Number(alt_m) || 0;
@@ -229,7 +306,7 @@ export default function PixelToMapNoCanvas({
         if (t < 0) return null; // up/behind
 
         const xE = t * d_enu[0];
-        const yN = t * d_enu[1]; // note: positive to North
+        const yN = t * d_enu[1];
 
         const { mlat, mlon } = metersPerDeg(baseLat);
         return {
@@ -239,7 +316,7 @@ export default function PixelToMapNoCanvas({
         };
     }
 
-    // ------------ Auto-fix “opposites” (light heuristic for bad sign combos) ------------
+    // ------------ Auto-fix “opposites” ------------
     function autoFixPose() {
         if (!imgW || !imgH) return;
         const u0 = imgW/2, v0 = imgH/2;
@@ -259,9 +336,7 @@ export default function PixelToMapNoCanvas({
                     let score = Number.POSITIVE_INFINITY;
                     if (hit) {
                         const dz = Math.abs((() => {
-                            // quick dz check
                             const _fx = fx || fxFromFovX(imgW, fovx);
-                            const _fy = fy || _fx;
                             const R_base = [[1,0,0],[0,-1,0],[0,0,-1]];
                             const R = matMul(Rz(deg2rad(yv)), matMul(Rx(deg2rad(pv)), matMul(Ry(deg2rad(-rv)), R_base)));
                             const d_cam = normalize([0,0,1]);
@@ -299,6 +374,7 @@ export default function PixelToMapNoCanvas({
             setCx(img.naturalWidth / 2);
             setCy(img.naturalHeight / 2);
             setScale(1); setTx(0); setTy(0);
+            setPoints([]); setNameCounter(1);
 
             try {
                 const meta: any = await exifr.parse(f, {
@@ -421,10 +497,11 @@ export default function PixelToMapNoCanvas({
                 // 4) manual FOV fallback
                 if ((!fx || !fy) || (fx===0 && fy===0)) {
                     const _fx = fxFromFovX(img.naturalWidth, fovx || 63);
-                    setFx(_fx); setFy(_fx);
+                    setFx(_fx); setFy(_fx); setCx(img.naturalWidth/2); setCy(img.naturalHeight/2);
+                } else {
+                    if (!Number.isFinite(cx) || !cx) setCx(img.naturalWidth / 2);
+                    if (!Number.isFinite(cy) || !cy) setCy(img.naturalHeight / 2);
                 }
-                if (!Number.isFinite(cx) || !cx) setCx(img.naturalWidth / 2);
-                if (!Number.isFinite(cy) || !cy) setCy(img.naturalHeight / 2);
 
                 setOut("Metadata parsed. Click the image to compute ground point.");
             } catch (e) {
@@ -517,14 +594,36 @@ export default function PixelToMapNoCanvas({
 
         const hit = project(uv.u, uv.v) as any;
         if (!hit) { setOut("Ray didn’t hit the ground plane (up/behind). Check AMSL/AGL or pose."); return; }
+
+        // Construct outputs
+        const decLat = hit.lat;
+        const decLon = hit.lon;
+        const dmsLat = toDMS(decLat, true);
+        const dmsLon = toDMS(decLon, false);
+        const gePoint = toGoogleEarthCoord(decLon, decLat, groundAlt); // lon,lat,alt
+
+        // Add to list
+        const id = Date.now();
+        const name = `P${nameCounter}`;
+        setNameCounter(c => c + 1);
+        const newPoint: HitPoint = {
+            id, name, pixelU: uv.u, pixelV: uv.v,
+            lat: decLat, lon: decLon,
+            altAMSL: alt_m, groundAltAMSL: groundAlt, agl: alt_m - groundAlt
+        };
+        setPoints(prev => [...prev, newPoint]);
+
         setOut([
             `Pixel (${uv.u.toFixed(1)}, ${uv.v.toFixed(1)})`,
-            `Lat: ${hit.lat.toFixed(7)}`,
-            `Lon: ${hit.lon.toFixed(7)}`,
+            `Lat: ${decLat.toFixed(7)}  (${dmsLat})`,
+            `Lon: ${decLon.toFixed(7)}  (${dmsLon})`,
+            `Google Earth coord (lon,lat,alt_AMSL):`,
+            `  ${gePoint}`,
             `groundAlt=${Number(groundAlt).toFixed(2)} m; alt=${Number(alt_m).toFixed(2)} m; AGL=${(alt_m - groundAlt).toFixed(2)} m`,
             `yaw=${Number(yaw).toFixed(2)}°, pitch=${Number(pitch).toFixed(2)}°, roll=${Number(roll).toFixed(2)}°`,
             `fx=${Number(fx).toFixed(2)}, fy=${Number(fy).toFixed(2)}, cx=${Number(cx).toFixed(2)}, cy=${Number(cy).toFixed(2)}`,
             `orientation: ${orientation}`,
+            `Saved as ${name}.`
         ].join("\n"));
     };
     const onDoubleClick: React.MouseEventHandler<HTMLDivElement> = () => { setScale(1); setTx(0); setTy(0); };
@@ -563,6 +662,79 @@ export default function PixelToMapNoCanvas({
             }}>Apply intrinsics</button>
 
             <div className={s.monoDim}>EXIF Orientation: {String(orientation)}</div>
+        </>
+    );
+
+    const GoogleEarthTools = (
+        <>
+            <h3 className={s.h3}>Google Earth / KML</h3>
+            <div className={s.monoDim}>Each click saves a point (lon,lat,alt=ground AMSL). Export all as KML or copy formats.</div>
+            <div className={s.rowBtns}>
+                <button
+                    className={s.btn}
+                    onClick={()=>{
+                        if (!points.length) { setOut("No points to export."); return; }
+                        const kml = buildKML(points);
+                        download("aw_points.kml", kml);
+                        setOut(prev=>prev + `\nExported ${points.length} point(s) to aw_points.kml`);
+                    }}
+                >Download KML</button>
+                <button
+                    className={s.btn}
+                    onClick={()=>{
+                        if (!points.length) { setOut("No points to copy."); return; }
+                        const last = points[points.length - 1];
+                        const s = toGoogleEarthCoord(last.lon, last.lat, last.groundAltAMSL);
+                        copy(s);
+                    }}
+                >Copy last (lon,lat,alt)</button>
+                <button
+                    className={s.btn}
+                    onClick={()=>{
+                        if (!points.length) { setOut("No points to copy."); return; }
+                        const last = points[points.length - 1];
+                        copy(`${last.lat.toFixed(7)}, ${last.lon.toFixed(7)}`);
+                    }}
+                >Copy last (lat, lon)</button>
+                <button
+                    className={s.btn}
+                    onClick={()=>{
+                        if (!points.length) { setOut("No points to copy."); return; }
+                        const last = points[points.length - 1];
+                        copy(`${toDMS(last.lat,true)}  ${toDMS(last.lon,false)}`);
+                    }}
+                >Copy last (DMS)</button>
+                <button
+                    className={s.btnDanger}
+                    onClick={()=>{ setPoints([]); setOut("Cleared points."); }}
+                >Clear points</button>
+            </div>
+
+            <div className={s.pointsTableWrap}>
+                <table className={s.tbl}>
+                    <thead>
+                    <tr>
+                        <th>#</th><th>Name</th><th>Pixel(u,v)</th><th>Lat</th><th>Lon</th><th>Alt(AMSL)</th><th>Ground(AMSL)</th><th>AGL</th><th>GE coord</th>
+                    </tr>
+                    </thead>
+                    <tbody>
+                    {points.map((p,idx)=>(
+                        <tr key={p.id}>
+                            <td>{idx+1}</td>
+                            <td>{p.name}</td>
+                            <td>({Math.round(p.pixelU)}, {Math.round(p.pixelV)})</td>
+                            <td>{p.lat.toFixed(7)}</td>
+                            <td>{p.lon.toFixed(7)}</td>
+                            <td>{p.altAMSL.toFixed(2)}</td>
+                            <td>{p.groundAltAMSL.toFixed(2)}</td>
+                            <td>{p.agl.toFixed(2)}</td>
+                            <td className={s.monoSmall}>{toGoogleEarthCoord(p.lon, p.lat, p.groundAltAMSL)}</td>
+                        </tr>
+                    ))}
+                    {!points.length && (<tr><td colSpan={9} className={s.monoDim}>— no points yet —</td></tr>)}
+                    </tbody>
+                </table>
+            </div>
         </>
     );
 
@@ -629,7 +801,10 @@ export default function PixelToMapNoCanvas({
                 <div className={s.panel}>{PoseIntrinsicsBlock}</div>
 
                 {/* Right */}
-                <div className={s.panel}>{ResultBlock}</div>
+                <div className={s.panel}>
+                    {GoogleEarthTools}
+                    {ResultBlock}
+                </div>
             </div>
 
             {/* ===== Modal Viewer ===== */}
@@ -662,7 +837,10 @@ export default function PixelToMapNoCanvas({
                             </div>
 
                             <div className={s.infoPane}>{PoseIntrinsicsBlock}</div>
-                            <div className={s.resultPane}>{ResultBlock}</div>
+                            <div className={s.resultPane}>
+                                {GoogleEarthTools}
+                                {ResultBlock}
+                            </div>
                         </div>
                     </div>
                 </div>
