@@ -1,10 +1,11 @@
 // PixelToMapNoCanvas_sony_static_cam.tsx
-// Robust EXIF parser for SONY ILCE-5100 (and DJI). Pulls:
-// lat, lon, absolute altitude (AMSL), relative altitude (AGL), ground altitude,
-// yaw/pitch/roll (prefers DJI gimbal/flight keys or your UserComment),
-// FOV (uses EXIF 'FOV', else 35mm equiv, else FocalLength+sensor width,
-// else manual fallback), and handles Orientation “Rotate 90 CW”.
-// Includes auto “opposite sign” fix and AMSL↔AGL linkage.
+// Static NADIR camera (always looks DOWN). No gimbal needed.
+// Robust EXIF parse for SONY ILCE-5100 (and DJI fields if present).
+// Pulls: lat, lon, AMSL, AGL/ground, yaw/pitch/roll (UserComment or DJI),
+// FOV (EXIF FOV → 35mmEq → FocalLength+sensor width → manual fallback),
+// handles EXIF Orientation, auto AMSL↔AGL linkage.
+// Conventions: ENU (x=East, y=North, z=Up). Camera coords set so that:
+// x_cam→East, y_cam→South, z_cam→Down (nadir base). So pixel +u=East, +v=South.
 
 import React, { useRef, useState } from "react";
 import * as exifr from "exifr";
@@ -12,7 +13,6 @@ import s from "./PixelToMapNoCanvas.module.scss";
 
 // --- small DB of sensor widths (mm) for FOV calc when FocalLength is present ---
 const SENSOR_WIDTH_MM_BY_MODEL: Record<string, number> = {
-    // APS-C Sony (ILCE-5100 et al.)
     "ILCE-5100": 23.5,
     "ILCE-6000": 23.5,
     "ILCE-6100": 23.5,
@@ -21,7 +21,7 @@ const SENSOR_WIDTH_MM_BY_MODEL: Record<string, number> = {
 };
 
 export default function PixelToMapNoCanvas({
-                                               enableOpenCV = false,
+                                               enableOpenCV = false, // kept for API compatibility; unused here
                                                opencvUrl = "/opencv/opencv.js",
                                            }: {
     enableOpenCV?: boolean;
@@ -47,7 +47,7 @@ export default function PixelToMapNoCanvas({
     const [fy, setFy] = useState(0);
     const [cx, setCx] = useState(0);
     const [cy, setCy] = useState(0);
-    const [fovx, setFovx] = useState(63); // deg fallback if EXIF has nothing usable
+    const [fovx, setFovx] = useState(63); // deg fallback
 
     // ------------ pose (AMSL alt; yaw ENU 0=N +CW; pitch +down; roll +right) ------------
     const [lat, setLat] = useState<number>(0);
@@ -60,7 +60,6 @@ export default function PixelToMapNoCanvas({
     const [agl, setAgl] = useState<number>(0);            // Height AGL
 
     // ------------ UI / misc ------------
-    const [mount, setMount] = useState<"forward" | "nadir">("forward");
     const [pixelStr, setPixelStr] = useState("");
     const [out, setOut] = useState("Select image, then click inside…");
     const [metaDump, setMetaDump] = useState<Record<string, any> | null>(null);
@@ -101,7 +100,7 @@ export default function PixelToMapNoCanvas({
     function numberFromMixedString(v: any): number | undefined {
         if (typeof v === "number" && Number.isFinite(v)) return v;
         if (typeof v === "string") {
-            const m = v.match(/-?\d+(?:\.\d+)?/);  // handles "1313.4 m Above Sea Level"
+            const m = v.match(/-?\d+(?:\.\d+)?/);
             if (m) return parseFloat(m[0]);
         }
         return undefined;
@@ -182,8 +181,11 @@ export default function PixelToMapNoCanvas({
         }
     }
 
-    // ------------ ENU projection to ground ------------
-    function project(uDisp: number, vDisp: number, opts?: { returnDz?: boolean }) {
+    // ------------ ENU projection to ground (STATIC NADIR) ------------
+    // Camera basis at nadir (no yaw/pitch/roll):
+    // x_cam→East, y_cam→South, z_cam→Down. So pixel +u→East, +v→South.
+    // Apply yaw (around Up), then pitch(+down) and roll(+right) as small tilts.
+    function project(uDisp: number, vDisp: number) {
         const { u, v } = uvDisplayToSensor(uDisp, vDisp);
 
         const _fx = Number.isFinite(fx) && fx !== 0 ? fx : fxFromFovX(imgW, fovx);
@@ -194,55 +196,84 @@ export default function PixelToMapNoCanvas({
         const baseLat = Number.isFinite(lat) ? lat : 0;
         const baseLon = Number.isFinite(lon) ? lon : 0;
 
-        const R_enu_body = matMul(Rz(deg2rad(yaw || 0)), matMul(Ry(deg2rad(pitch || 0)), Rx(deg2rad(roll || 0))));
-        const R_body_cam = mount === "nadir" ? Rx(deg2rad(-90)) : ([[1,0,0],[0,1,0],[0,0,1]] as number[][]);
-        const R_enu_cam = matMul(R_enu_body, R_body_cam);
+        // Base R that maps camera vector → ENU at perfect nadir, yaw=0
+        // Columns are ENU axes of (x_cam, y_cam, z_cam):
+        // x_cam(East)=[1,0,0], y_cam(South)=[0,-1,0], z_cam(Down)=[0,0,-1]
+        const R_base = [
+            [ 1,  0,  0],
+            [ 0, -1,  0],
+            [ 0,  0, -1],
+        ] as number[][];
 
-        function trySolve(zSign: number) {
-            const x = (u - _cx) / _fx, y = (v - _cy) / _fy;
-            const d_cam = normalize([x, y, zSign]);
-            const d_enu = matVec(R_enu_cam, d_cam);
-            const dz = d_enu[2];
-            if (opts?.returnDz) return dz;
-            if (Math.abs(dz) < 1e-9) return null;
-            const t = ((groundAlt || 0) - (alt_m || 0)) / dz;
-            if (t < 0) return null; // up/behind
-            const xE = t * d_enu[0], yN = t * d_enu[1];
-            const { mlat, mlon } = metersPerDeg(baseLat);
-            return { lat: baseLat + yN / mlat, lon: baseLon + xE / mlon, range: Math.hypot(xE, yN) };
-        }
-        return trySolve(+1) ?? trySolve(-1);
+        // Apply yaw about Up (ENU z), then tilt by pitch(+down) about ENU x? and roll(+right) about ENU y?
+        // Practically, body tilts are small; a good stable approximation is to rotate the camera frame
+        // by yaw(pivot Up), then pitch about East(+down), then roll about North(+right):
+        const R_yaw   = Rz( deg2rad(yaw || 0) );
+        const R_pitch = Rx( deg2rad(pitch || 0) ); // +down ≈ rotate forward/down around East (x)
+        const R_roll  = Ry( deg2rad(-roll || 0) ); // +right ≈ rotate around North (y), sign chosen to match screen right
+
+        const R_enu_cam = matMul(R_yaw, matMul(R_pitch, matMul(R_roll, R_base)));
+
+        // Pinhole ray in camera coords (z_cam forward is Down here)
+        const x = (u - _cx) / _fx;
+        const y = (v - _cy) / _fy;
+        const d_cam = normalize([x, y, 1]); // points mostly Down
+        const d_enu = matVec(R_enu_cam, d_cam); // ENU ray
+
+        const dz = d_enu[2]; // Up component; for nadir ray dz should be negative
+        if (Math.abs(dz) < 1e-12) return null;
+
+        const camAlt = Number(alt_m) || 0;
+        const gAlt   = Number(groundAlt) || 0;
+        const t = (gAlt - camAlt) / dz; // intersect z = gAlt
+        if (t < 0) return null; // up/behind
+
+        const xE = t * d_enu[0];
+        const yN = t * d_enu[1]; // note: positive to North
+
+        const { mlat, mlon } = metersPerDeg(baseLat);
+        return {
+            lat: baseLat + yN / mlat,
+            lon: baseLon + xE / mlon,
+            range: Math.hypot(xE, yN),
+        };
     }
 
-    // ------------ Auto-fix “opposites” ------------
+    // ------------ Auto-fix “opposites” (light heuristic for bad sign combos) ------------
     function autoFixPose() {
         if (!imgW || !imgH) return;
         const u0 = imgW/2, v0 = imgH/2;
 
-        type Conf = { pitch:number; roll:number; yaw:number; mount:"forward"|"nadir"; score:number; };
+        type Conf = { pitch:number; roll:number; yaw:number; score:number; };
         const cand: Conf[] = [];
-        const yawVars = [ yaw, -yaw ];
+        const yawVars   = [ yaw, -yaw ];
         const pitchVars = [ pitch, -pitch ];
-        const rollVars = [ roll, -roll ];
-        const mounts: Array<"forward"|"nadir"> = [ "forward", "nadir" ];
+        const rollVars  = [ roll, -roll ];
 
         for (const yv of yawVars)
             for (const pv of pitchVars)
-                for (const rv of rollVars)
-                    for (const m of mounts) {
-                        const bak = { yaw, pitch, roll, mount };
-                        setYaw(yv); setPitch(pv); setRoll(rv); setMount(m);
-                        const hit = project(u0, v0) as any;
-                        let score = Number.POSITIVE_INFINITY;
-                        if (hit) {
-                            const dzPlus  = project(u0, v0, { returnDz: true }) as any;
-                            const dz = Math.abs(dzPlus ?? 0);
-                            const dist = Math.max(1, hit.range || 1);
-                            score = dist + (1/(dz+1e-6))*50; // heuristic
-                        }
-                        cand.push({ pitch: pv, roll: rv, yaw: yv, mount: m, score });
-                        setYaw(bak.yaw); setPitch(bak.pitch); setRoll(bak.roll); setMount(bak.mount);
+                for (const rv of rollVars) {
+                    const bak = { yaw, pitch, roll };
+                    setYaw(yv); setPitch(pv); setRoll(rv);
+                    const hit = project(u0, v0) as any;
+                    let score = Number.POSITIVE_INFINITY;
+                    if (hit) {
+                        const dz = Math.abs((() => {
+                            // quick dz check
+                            const _fx = fx || fxFromFovX(imgW, fovx);
+                            const _fy = fy || _fx;
+                            const R_base = [[1,0,0],[0,-1,0],[0,0,-1]];
+                            const R = matMul(Rz(deg2rad(yv)), matMul(Rx(deg2rad(pv)), matMul(Ry(deg2rad(-rv)), R_base)));
+                            const d_cam = normalize([0,0,1]);
+                            const d_enu = matVec(R, d_cam);
+                            return d_enu[2];
+                        })());
+                        const dist = Math.max(1, hit.range || 1);
+                        score = dist + (1/(dz+1e-6))*50;
                     }
+                    cand.push({ pitch: pv, roll: rv, yaw: yv, score });
+                    setYaw(bak.yaw); setPitch(bak.pitch); setRoll(bak.roll);
+                }
 
         cand.sort((a,b)=>a.score-b.score);
         const best = cand[0];
@@ -250,8 +281,8 @@ export default function PixelToMapNoCanvas({
             setOut("Auto-fix: no valid ground intersection. Check AMSL/AGL.");
             return;
         }
-        setYaw(best.yaw); setPitch(best.pitch); setRoll(best.roll); setMount(best.mount);
-        setOut(`Auto-fix → yaw=${best.yaw.toFixed(3)}  pitch=${best.pitch.toFixed(3)}  roll=${best.roll.toFixed(3)}  mount=${best.mount}`);
+        setYaw(best.yaw); setPitch(best.pitch); setRoll(best.roll);
+        setOut(`Auto-fix → yaw=${best.yaw.toFixed(3)}  pitch=${best.pitch.toFixed(3)}  roll=${best.roll.toFixed(3)}`);
     }
 
     // ------------ file load + metadata parse ------------
@@ -270,13 +301,6 @@ export default function PixelToMapNoCanvas({
             setScale(1); setTx(0); setTy(0);
 
             try {
-                             // naxkin kode usercommenty cher parse anum
-
-                // const meta: any = await exifr.parse(f, { xmp: true, icc: false, tiff: true, jfif: true, ihdr: true });
-                // setMetaDump(meta ?? {});
-
-
-
                 const meta: any = await exifr.parse(f, {
                     xmp: true,
                     icc: false,
@@ -284,68 +308,11 @@ export default function PixelToMapNoCanvas({
                     jfif: true,
                     ihdr: true,
                     userComment: true,
-                    makerNote: true,      // <—— սա թույլ է տալիս կարդալ Sony MakerNotes-ը
-                    multiSegment: true,   // <—— երբեմն SONY UserComment-ը լինում է երկրորդ սեգմենտում
+                    makerNote: true,
+                    multiSegment: true,
                 });
-                console.log("=== EXIF RAW METADATA ===", meta);
-                console.log("UserComment raw:", meta.UserComment);
-
-
-                console.log("=== EXIF RAW METADATA ===", meta);
-                console.log("UserComment raw:", meta.UserComment);
-                if (meta.UserComment instanceof Uint8Array) {
-                    const ucText = new TextDecoder("utf-8").decode(meta.UserComment);
-                    console.log("UserComment decoded:", ucText);
-                }
-
-
-                console.log(Object.keys(meta), 'testtttttttttttttt');
-
-                // --- Decode Sony UserComment safely (works for ILCE-5100) ---
-                let userComment = "";
-
-// Sony sometimes stores UserComment as a byte array, not a string
-                const ucRaw =
-                    meta.UserComment ??
-                    meta.userComment ??
-                    meta["User Comment"] ??
-                    meta.makerNote;
-
-                if (ucRaw) {
-                    if (typeof ucRaw === "string") {
-                        userComment = ucRaw;
-                    } else if (ucRaw instanceof Uint8Array || Array.isArray(ucRaw)) {
-                        // Convert byte array to readable text
-                        try {
-                            const bytes = Array.from(ucRaw as any);
-                            // Drop ASCII header if present (65,83,67,73,73 = "ASCII")
-                            const asciiIndex = bytes.join(",").indexOf("65,83,67,73,73");
-                            const cleanBytes =
-                                asciiIndex >= 0 ? bytes.slice(asciiIndex + 8) : bytes;
-                            userComment = new TextDecoder("ascii").decode(
-                                new Uint8Array(cleanBytes)
-                            );
-                        } catch {
-                            userComment = "";
-                        }
-                    }
-                }
-
-                console.log("Decoded UserComment text:", userComment);
-
-// Extract Pitch / Roll / Yaw numbers
-                const kv: any = {};
-                const rx = /(Lat|Lon|Pitch|Roll|Yaw)\s*=\s*(-?\d+(?:\.\d+)?)/gi;
-                let m: RegExpExecArray | null;
-                while ((m = rx.exec(userComment)) !== null)
-                    kv[m[1].toLowerCase()] = parseFloat(m[2]);
-
-                if (Number.isFinite(kv.pitch)) setPitch(kv.pitch);
-                if (Number.isFinite(kv.roll))  setRoll(kv.roll);
-                if (Number.isFinite(kv.yaw))   setYaw(kv.yaw);
-
-
-                // Orientation: prefer CameraOrientation for Sony if present
+                setMetaDump(meta ?? {});
+                // Orientation
                 const ori =
                     meta.CameraOrientation ??
                     meta.Orientation ??
@@ -353,11 +320,34 @@ export default function PixelToMapNoCanvas({
                     meta["orientation"];
                 setOrientation(String(ori ?? "Horizontal (normal)"));
 
-                // UserComment (your format)
-                // const uc = String(meta.UserComment || meta.usercomment || "");
-                const uc = String(meta.UserComment || meta.usercomment || "");
-
-                const kc = parseUserComment(uc); // {lat, lon, pitch, roll, yaw?}
+                // ---- Robust UserComment decode (Sony often stores bytes) ----
+                let userComment = "";
+                const ucRaw =
+                    meta.UserComment ??
+                    meta.userComment ??
+                    meta["User Comment"] ??
+                    meta.makerNote;
+                if (ucRaw) {
+                    if (typeof ucRaw === "string") {
+                        userComment = ucRaw;
+                    } else if (ucRaw instanceof Uint8Array || Array.isArray(ucRaw)) {
+                        try {
+                            const bytes = ucRaw instanceof Uint8Array ? ucRaw : new Uint8Array(ucRaw as any);
+                            // Drop "ASCII\0\0\0" header if present
+                            let start = 0;
+                            if (bytes.length >= 8 &&
+                                bytes[0]===0x41 && bytes[1]===0x53 && bytes[2]===0x43 && bytes[3]===0x49 && bytes[4]===0x49) {
+                                start = 8;
+                            }
+                            // try ascii then utf-8
+                            userComment = new TextDecoder("ascii").decode(bytes.slice(start)).trim();
+                            if (!/Lat|Lon|Pitch|Roll|Yaw/i.test(userComment)) {
+                                userComment = new TextDecoder("utf-8").decode(bytes.slice(start)).trim();
+                            }
+                        } catch { userComment = ""; }
+                    }
+                }
+                const kc = parseUserComment(userComment); // lat, lon, pitch, roll, yaw?
 
                 // Latitude/Longitude
                 const latRef = meta.GPSLatitudeRef ?? meta.gpslatituderef ?? "N";
@@ -378,46 +368,43 @@ export default function PixelToMapNoCanvas({
                     setAgl(relAlt as number);
                     if (Number.isFinite(absAltPref)) setGroundAlt((absAltPref as number) - (relAlt as number));
                 } else {
-                    // no AGL in EXIF → keep previous or default 2 m
                     const initAGL = (agl && agl>0) ? agl : 2;
                     setAgl(initAGL);
                     if (Number.isFinite(absAltPref)) setGroundAlt((absAltPref as number) - initAGL);
                 }
 
-                // Attitude (prefer DJI keys; else Sony UserComment)
+                // Attitude: prefer DJI keys; else Sony UserComment
                 const yawPref =
                     numberFromMixedString(pickFirst(meta, ["GimbalYawDegree","FlightYawDegree","CameraYaw","Yaw"])) ??
                     kc.yaw;
                 const pitchPref =
                     numberFromMixedString(pickFirst(meta, ["GimbalPitchDegree","FlightPitchDegree","CameraPitch","Pitch"])) ??
-                    kc.pitch;  // we treat +down
+                    kc.pitch;
                 const rollPref =
                     numberFromMixedString(pickFirst(meta, ["GimbalRollDegree","FlightRollDegree","CameraRoll","Roll"])) ??
-                    kc.roll;   // +right
+                    kc.roll;
 
                 if (Number.isFinite(yawPref))   setYaw(yawPref as number);
                 if (Number.isFinite(pitchPref)) setPitch(pitchPref as number);
                 if (Number.isFinite(rollPref))  setRoll(rollPref as number);
 
                 // ------ FOV / intrinsics ------
-                // 1) Use explicit FOV if present (DJI “FOV: 84.0 deg” or XMP)
+                // 1) Explicit FOV
                 let fovxDeg =
-                    numberFromMixedString(pickFirst(meta, ["FOV","HFOV","HorizontalFOV"])) ??
-                    undefined;
+                    numberFromMixedString(pickFirst(meta, ["FOV","HFOV","HorizontalFOV"])) ?? undefined;
 
-                // 2) Else, use 35mm equivalent (FocalLengthIn35mmFormat) if >0
+                // 2) 35mm equivalent
                 if (!Number.isFinite(fovxDeg)) {
                     const f35 = numberFromMixedString(
                         pickFirst(meta, ["FocalLengthIn35mmFormat","ExifIFD:FocalLengthIn35mmFilm"])
                     );
                     if (Number.isFinite(f35) && (f35 as number) > 0) {
-                        // fx(px) = (f35/36) * Wpx
                         const fx35 = (Number(f35) / 36) * img.naturalWidth;
                         setFx(fx35); setFy(fx35);
                     }
                 }
 
-                // 3) Else, use FocalLength (mm) + sensor width for known bodies
+                // 3) FocalLength (mm) + sensor width
                 if ((!fx || !fy) || (fx===0 && fy===0)) {
                     const fmm = numberFromMixedString(pickFirst(meta, ["FocalLength"]));
                     const model = String(meta.Model || "");
@@ -426,13 +413,12 @@ export default function PixelToMapNoCanvas({
                         const f = Number(fmm);
                         const sw = Number(sensorW);
                         fovxDeg = 2 * (180/Math.PI) * Math.atan((sw/2) / f);
-                        // convert to fx pixels
                         const _fx = fxFromFovX(img.naturalWidth, fovxDeg);
                         setFx(_fx); setFy(_fx);
                     }
                 }
 
-                // 4) If still nothing usable, keep your manual FOVx fallback
+                // 4) manual FOV fallback
                 if ((!fx || !fy) || (fx===0 && fy===0)) {
                     const _fx = fxFromFovX(img.naturalWidth, fovx || 63);
                     setFx(_fx); setFy(_fx);
@@ -523,17 +509,14 @@ export default function PixelToMapNoCanvas({
         if (!Number.isFinite(lat) || !Number.isFinite(lon)) { setOut("No GPS in metadata. Fill Latitude/Longitude first."); return; }
 
         // AMSL/AGL linkage
-        if (Number.isFinite(alt_m) && Number.isFinite(agl)) {
-            setGroundAlt(alt_m - agl);
-        }
-
+        if (Number.isFinite(alt_m) && Number.isFinite(agl)) setGroundAlt(alt_m - agl);
         if (!Number.isFinite(alt_m) || !Number.isFinite(groundAlt)) {
             setOut("Set Altitude (AMSL) and either Ground Alt (AMSL) or Height AGL.");
             return;
         }
 
         const hit = project(uv.u, uv.v) as any;
-        if (!hit) { setOut("Ray didn’t hit the ground plane (up/behind). Try Auto-fix pose or check AMSL/AGL."); return; }
+        if (!hit) { setOut("Ray didn’t hit the ground plane (up/behind). Check AMSL/AGL or pose."); return; }
         setOut([
             `Pixel (${uv.u.toFixed(1)}, ${uv.v.toFixed(1)})`,
             `Lat: ${hit.lat.toFixed(7)}`,
@@ -541,7 +524,7 @@ export default function PixelToMapNoCanvas({
             `groundAlt=${Number(groundAlt).toFixed(2)} m; alt=${Number(alt_m).toFixed(2)} m; AGL=${(alt_m - groundAlt).toFixed(2)} m`,
             `yaw=${Number(yaw).toFixed(2)}°, pitch=${Number(pitch).toFixed(2)}°, roll=${Number(roll).toFixed(2)}°`,
             `fx=${Number(fx).toFixed(2)}, fy=${Number(fy).toFixed(2)}, cx=${Number(cx).toFixed(2)}, cy=${Number(cy).toFixed(2)}`,
-            `mount: ${mount}; orientation: ${orientation}`,
+            `orientation: ${orientation}`,
         ].join("\n"));
     };
     const onDoubleClick: React.MouseEventHandler<HTMLDivElement> = () => { setScale(1); setTx(0); setTy(0); };
@@ -549,7 +532,7 @@ export default function PixelToMapNoCanvas({
     // ------------ UI blocks ------------
     const PoseIntrinsicsBlock = (
         <>
-            <h3 className={s.h3}>Pose</h3>
+            <h3 className={s.h3}>Pose (NADIR)</h3>
             {num("Latitude (°)", lat, setLat, 1e-7)}
             {num("Longitude (°)", lon, setLon, 1e-7)}
             {num("Altitude (m, AMSL)", alt_m, (v)=>{ setAlt(v); setGroundAlt(v - agl); })}
@@ -579,11 +562,6 @@ export default function PixelToMapNoCanvas({
                 setOut("Intrinsics updated from FOVx.");
             }}>Apply intrinsics</button>
 
-            <h3 className={s.h3}>Mount & Orientation</h3>
-            <select value={mount} onChange={(e)=>setMount(e.target.value as any)} className={s.select}>
-                <option value="forward">Forward (z along heading)</option>
-                <option value="nadir">Down (nadir)</option>
-            </select>
             <div className={s.monoDim}>EXIF Orientation: {String(orientation)}</div>
         </>
     );
@@ -595,32 +573,32 @@ export default function PixelToMapNoCanvas({
 
             <h4 className={s.h4}>Parsed Metadata (key fields)</h4>
             <pre className={s.preSmall}>
-        {metaDump ? JSON.stringify({
-            Orientation: orientation,
-            GPSLatitude: metaDump.GPSLatitude,
-            GPSLongitude: metaDump.GPSLongitude,
-            GPSAltitude: metaDump.GPSAltitude,
-            GPSAltitudeRef: metaDump.GPSAltitudeRef,
-            AbsoluteAltitude: metaDump.AbsoluteAltitude,
-            RelativeAltitude: metaDump.RelativeAltitude,
-            GimbalYawDegree: metaDump.GimbalYawDegree,
-            GimbalPitchDegree: metaDump.GimbalPitchDegree,
-            GimbalRollDegree: metaDump.GimbalRollDegree,
-            FlightYawDegree: metaDump.FlightYawDegree,
-            FlightPitchDegree: metaDump.FlightPitchDegree,
-            FlightRollDegree: metaDump.FlightRollDegree,
-            CameraYaw: metaDump.CameraYaw,
-            CameraPitch: metaDump.CameraPitch,
-            CameraRoll: metaDump.CameraRoll,
-            FOV: metaDump.FOV,
-            FocalLength: metaDump.FocalLength,
-            FocalLengthIn35mmFormat: metaDump.FocalLengthIn35mmFormat,
-            Model: metaDump.Model,
-            Make: metaDump.Make,
-            UserComment: metaDump.UserComment,
-            ExifImageWidth: metaDump.ExifImageWidth,
-            ExifImageHeight: metaDump.ExifImageHeight,
-        }, null, 2) : "—"}
+{metaDump ? JSON.stringify({
+    Orientation: orientation,
+    GPSLatitude: metaDump.GPSLatitude,
+    GPSLongitude: metaDump.GPSLongitude,
+    GPSAltitude: metaDump.GPSAltitude,
+    GPSAltitudeRef: metaDump.GPSAltitudeRef,
+    AbsoluteAltitude: metaDump.AbsoluteAltitude,
+    RelativeAltitude: metaDump.RelativeAltitude,
+    GimbalYawDegree: metaDump.GimbalYawDegree,
+    GimbalPitchDegree: metaDump.GimbalPitchDegree,
+    GimbalRollDegree: metaDump.GimbalRollDegree,
+    FlightYawDegree: metaDump.FlightYawDegree,
+    FlightPitchDegree: metaDump.FlightPitchDegree,
+    FlightRollDegree: metaDump.FlightRollDegree,
+    CameraYaw: metaDump.CameraYaw,
+    CameraPitch: metaDump.CameraPitch,
+    CameraRoll: metaDump.CameraRoll,
+    FOV: metaDump.FOV,
+    FocalLength: metaDump.FocalLength,
+    FocalLengthIn35mmFormat: metaDump.FocalLengthIn35mmFormat,
+    Model: metaDump.Model,
+    Make: metaDump.Make,
+    UserComment: metaDump.UserComment,
+    ExifImageWidth: metaDump.ExifImageWidth,
+    ExifImageHeight: metaDump.ExifImageHeight,
+}, null, 2) : "—"}
       </pre>
         </>
     );
