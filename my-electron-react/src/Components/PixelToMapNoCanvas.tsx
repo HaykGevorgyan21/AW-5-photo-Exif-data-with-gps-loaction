@@ -1,25 +1,21 @@
 // PixelToMapNoCanvas_sony_static_cam.tsx
 // Static NADIR camera (always looks DOWN). No gimbal needed.
-// Robust EXIF parse for SONY ILCE-5100 (and DJI fields if present).
-// Pulls: lat, lon, AMSL, AGL/ground, yaw/pitch/roll (UserComment or DJI),
-// FOV (EXIF FOV → 35mmEq → FocalLength+sensor width → manual fallback),
-// handles EXIF Orientation, auto AMSL↔AGL linkage.
-// Conventions: ENU (x=East, y=North, z=Up). Camera coords set so that:
-// x_cam→East, y_cam→South, z_cam→Down (nadir base). So pixel +u=East, +v=South.
+// + Offline Ground Altitude from local DEM GeoTIFF (no internet).
+//
+// Requires: npm i geotiff
+//
+// Parses EXIF (Sony/DJI), projects pixel->lat/lon on ground plane,
+// and (if DEM is loaded) samples ground altitude at camera GPS to link AMSL↔AGL.
+// ENU: x=East, y=North, z=Up. Camera: x_cam→East, y_cam→South, z_cam→Down.
 
-import React, { useRef, useState } from "react";
+import React, { useRef, useState, useEffect } from "react";
 import * as exifr from "exifr";
+import { fromUrl, fromArrayBuffer, GeoTIFF, GeoTIFFImage } from "geotiff";
 import s from "./PixelToMapNoCanvas.module.scss";
 
-// --- small DB of sensor widths (mm) for FOV calc when FocalLength is present ---
-const SENSOR_WIDTH_MM_BY_MODEL: Record<string, number> = {
-    "ILCE-5100": 23.5,
-    "ILCE-6000": 23.5,
-    "ILCE-6100": 23.5,
-    "ILCE-6300": 23.5,
-    "ILCE-6400": 23.5,
-};
-
+// --- sensor widths for FOV estimation ---
+const SENSOR_WIDTH_MM_BY_MODEL: Record<string, number> = { "ILCE-5100": 23.5, "ILCE-6000": 23.5, "ILCE-6100": 23.5, "ILCE-6300": 23.5, "ILCE-6400": 23.5, };
+const DEM_OFFSET_M = 34
 type HitPoint = {
     id: number;
     name: string;
@@ -27,13 +23,29 @@ type HitPoint = {
     pixelV: number;
     lat: number;
     lon: number;
-    altAMSL: number; // we’ll store camera AMSL for reference
+    altAMSL: number;
     groundAltAMSL: number;
     agl: number;
 };
 
+// ---- DEM state ----
+type DemState = {
+    tiff?: GeoTIFF;
+    img?: GeoTIFFImage;
+    width?: number;
+    height?: number;
+    originX?: number;     // top-left lon
+    originY?: number;     // top-left lat
+    resX?: number;        // pixel width in deg (EPSG:4326) or map units
+    resY?: number;        // pixel height (usually negative for north-up)
+    noData?: number | null;
+    isGeographic4326?: boolean; // best-effort check
+    unit?: string;        // "metre" typical
+    summary?: string;     // printable brief
+} | null;
+
 export default function PixelToMapNoCanvas({
-                                               enableOpenCV = false, // kept for API compatibility; unused here
+                                               enableOpenCV = false,
                                                opencvUrl = "/opencv/opencv.js",
                                            }: {
     enableOpenCV?: boolean;
@@ -61,26 +73,31 @@ export default function PixelToMapNoCanvas({
     const [cy, setCy] = useState(0);
     const [fovx, setFovx] = useState(63); // deg fallback
 
-    // ------------ pose (AMSL alt; yaw ENU 0=N +CW; pitch +down; roll +right) ------------
+    // ------------ pose ------------
     const [lat, setLat] = useState<number>(0);
     const [lon, setLon] = useState<number>(0);
     const [alt_m, setAlt] = useState<number>(0);          // camera AMSL
-    const [yaw, setYaw] = useState<number>(0);            // 0=N, +CW
-    const [pitch, setPitch] = useState<number>(0);        // +down
-    const [roll, setRoll] = useState<number>(0);          // +right
-    const [groundAlt, setGroundAlt] = useState<number>(0);// ground AMSL
-    const [agl, setAgl] = useState<number>(0);            // Height AGL
+    const [yaw, setYaw] = useState<number>(0);
+    const [pitch, setPitch] = useState<number>(0);
+    const [roll, setRoll] = useState<number>(0);
+    const [groundAlt, setGroundAlt] = useState<number>(0);
+    const [agl, setAgl] = useState<number>(0);
+    const [cursorPos, setCursorPos] = useState<{x:number; y:number} | null>(null);
 
     // ------------ UI / misc ------------
     const [pixelStr, setPixelStr] = useState("");
-    const [out, setOut] = useState("Select image, then click inside…");
+    const [out, setOut] = useState("Պատկերը բեռնիր, հետո սեղմիր վրա…");
     const [metaDump, setMetaDump] = useState<Record<string, any> | null>(null);
     const [orientation, setOrientation] = useState<string>("Horizontal (normal)");
     const [viewerOpen, setViewerOpen] = useState(false);
 
-    // --- clicked points (for KML export) ---
+    // points for KML
     const [points, setPoints] = useState<HitPoint[]>([]);
     const [nameCounter, setNameCounter] = useState(1);
+
+    // ---- DEM handling ----
+    const [dem, setDem] = useState<DemState>(null);
+    const [autoSampleDEM, setAutoSampleDEM] = useState<boolean>(true);
 
     // ------------ math helpers ------------
     const deg2rad = (d: number) => (d * Math.PI) / 180;
@@ -103,8 +120,8 @@ export default function PixelToMapNoCanvas({
     function normalize(v: number[]) { const n = Math.hypot(v[0], v[1], v[2]) || 1; return [v[0]/n, v[1]/n, v[2]/n]; }
     function metersPerDeg(latDeg: number) {
         const L = deg2rad(latDeg || 0);
-        const mlat = 111132.92 - 559.82 * Math.cos(2*L) + 1.175 * Math.cos(4*L) - 0.0023 * Math.cos(6*L);
-        const mlon = 111412.84 * Math.cos(L) - 93.5 * Math.cos(3*L) + 0.118 * Math.cos(5*L);
+        const mlat = 111132.92 - 559.82*Math.cos(2*L) + 1.175*Math.cos(4*L) - 0.0023*Math.cos(6*L);
+        const mlon = 111412.84*Math.cos(L) - 93.5*Math.cos(3*L) + 0.118*Math.cos(5*L);
         return { mlat, mlon };
     }
     function fxFromFovX(W: number, fovx_deg: number) {
@@ -112,7 +129,7 @@ export default function PixelToMapNoCanvas({
         return W/2 / Math.max(half, 1e-9);
     }
 
-    // ------------ formatting helpers (for Google Earth & DMS) ------------
+    // ------------ format helpers ------------
     function toDMS(value: number, isLat: boolean) {
         const hemi = isLat ? (value >= 0 ? "N" : "S") : (value >= 0 ? "E" : "W");
         const abs = Math.abs(value);
@@ -123,20 +140,24 @@ export default function PixelToMapNoCanvas({
         return `${D}° ${M}' ${S.toFixed(3)}" ${hemi}`;
     }
     function toGoogleEarthCoord(lon: number, lat: number, altAMSL?: number) {
-        // KML uses "lon,lat,alt" with meters AMSL (or omit alt + clampToGround)
         if (Number.isFinite(altAMSL)) return `${lon.toFixed(7)},${lat.toFixed(7)},${Number(altAMSL).toFixed(2)}`;
         return `${lon.toFixed(7)},${lat.toFixed(7)}`;
+    }
+    function escapeXml(s: string) {
+        return s.replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;").replace(/"/g,"&quot;").replace(/'/g,"&apos;");
     }
     function buildKML(points: HitPoint[]) {
         const header = `<?xml version="1.0" encoding="UTF-8"?>
 <kml xmlns="http://www.opengis.net/kml/2.2">
   <Document>
     <name>AW Points</name>
+    <Style id="awPoint">
+      <IconStyle><scale>1.2</scale><Icon><href>http://maps.google.com/mapfiles/kml/paddle/red-circle.png</href></Icon></IconStyle>
+    </Style>
 `;
-        const footer = `  </Document>
-</kml>`;
+        const footer = `  </Document>\n</kml>`;
         const body = points.map(p => {
-            const coord = toGoogleEarthCoord(p.lon, p.lat, p.groundAltAMSL /* ground AMSL as point alt */);
+            const coord = toGoogleEarthCoord(p.lon, p.lat, p.groundAltAMSL);
             return `    <Placemark>
       <name>${escapeXml(p.name)}</name>
       <description><![CDATA[
@@ -147,23 +168,10 @@ export default function PixelToMapNoCanvas({
         AGL: ${p.agl.toFixed(2)} m
       ]]></description>
       <styleUrl>#awPoint</styleUrl>
-      <Point>
-        <altitudeMode>absolute</altitudeMode>
-        <coordinates>${coord}</coordinates>
-      </Point>
+      <Point><altitudeMode>absolute</altitudeMode><coordinates>${coord}</coordinates></Point>
     </Placemark>`;
         }).join("\n");
-        const style = `    <Style id="awPoint">
-      <IconStyle>
-        <scale>1.2</scale>
-        <Icon><href>http://maps.google.com/mapfiles/kml/paddle/red-circle.png</href></Icon>
-      </IconStyle>
-    </Style>
-`;
-        return header + style + body + "\n" + footer;
-    }
-    function escapeXml(s: string) {
-        return s.replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;").replace(/"/g,"&quot;").replace(/'/g,"&apos;");
+        return header + body + "\n" + footer;
     }
     async function copy(text: string) {
         try { await navigator.clipboard.writeText(text); setOut(prev => prev + `\nCopied.`); }
@@ -245,28 +253,23 @@ export default function PixelToMapNoCanvas({
         return kv; // { lat, lon, pitch, roll, yaw }
     }
 
-    // ------------ Orientation → convert display u,v to sensor u,v ------------
+    // ------------ Orientation map ------------
     function uvDisplayToSensor(u: number, v: number) {
         switch ((orientation || "").toLowerCase()) {
             case "rotate 90 cw":
             case "right-top":
-            case "6":
-                return { u: v, v: imgW - u };
+            case "6":  return { u: v, v: imgW - u };
             case "rotate 270 cw":
             case "left-bottom":
-            case "8":
-                return { u: imgH - v, v: u };
+            case "8":  return { u: imgH - v, v: u };
             case "rotate 180":
             case "bottom-right":
-            case "3":
-                return { u: imgW - u, v: imgH - v };
-            default: // Horizontal (normal)
-                return { u, v };
+            case "3":  return { u: imgW - u, v: imgH - v };
+            default:   return { u, v };
         }
     }
 
-    // ------------ ENU projection to ground (STATIC NADIR) ------------
-    // x_cam→East, y_cam→South, z_cam→Down. So pixel +u→East, +v→South.
+    // ------------ Projection to ground (static nadir) ------------
     function project(uDisp: number, vDisp: number) {
         const { u, v } = uvDisplayToSensor(uDisp, vDisp);
 
@@ -278,45 +281,34 @@ export default function PixelToMapNoCanvas({
         const baseLat = Number.isFinite(lat) ? lat : 0;
         const baseLon = Number.isFinite(lon) ? lon : 0;
 
-        // Base mapping camera→ENU at nadir
-        const R_base = [
-            [ 1,  0,  0],
-            [ 0, -1,  0],
-            [ 0,  0, -1],
-        ] as number[][];
-
-        // yaw about Up, then pitch(+down) about East, roll(+right) about North
+        // camera->ENU at nadir
+        const R_base = [[1,0,0],[0,-1,0],[0,0,-1]] as number[][];
         const R_yaw   = Rz( deg2rad(yaw || 0) );
         const R_pitch = Rx( deg2rad(pitch || 0) );
         const R_roll  = Ry( deg2rad(-roll || 0) );
         const R_enu_cam = matMul(R_yaw, matMul(R_pitch, matMul(R_roll, R_base)));
 
-        // pinhole
         const x = (u - _cx) / _fx;
         const y = (v - _cy) / _fy;
-        const d_cam = normalize([x, y, 1]); // forward is Down
-        const d_enu = matVec(R_enu_cam, d_cam); // ENU ray
+        const d_cam = normalize([x, y, 1]);
+        const d_enu = matVec(R_enu_cam, d_cam);
 
-        const dz = d_enu[2]; // Up component (nadir → negative)
+        const dz = d_enu[2]; // Up component
         if (Math.abs(dz) < 1e-12) return null;
 
         const camAlt = Number(alt_m) || 0;
         const gAlt   = Number(groundAlt) || 0;
-        const t = (gAlt - camAlt) / dz; // intersect z = gAlt
-        if (t < 0) return null; // up/behind
+        const t = (gAlt - camAlt) / dz;
+        if (t < 0) return null;
 
         const xE = t * d_enu[0];
         const yN = t * d_enu[1];
 
         const { mlat, mlon } = metersPerDeg(baseLat);
-        return {
-            lat: baseLat + yN / mlat,
-            lon: baseLon + xE / mlon,
-            range: Math.hypot(xE, yN),
-        };
+        return { lat: baseLat + yN / mlat, lon: baseLon + xE / mlon, range: Math.hypot(xE, yN) };
     }
 
-    // ------------ Auto-fix “opposites” ------------
+    // ------------ Auto-fix pose (sign opps) ------------
     function autoFixPose() {
         if (!imgW || !imgH) return;
         const u0 = imgW/2, v0 = imgH/2;
@@ -336,7 +328,6 @@ export default function PixelToMapNoCanvas({
                     let score = Number.POSITIVE_INFINITY;
                     if (hit) {
                         const dz = Math.abs((() => {
-                            const _fx = fx || fxFromFovX(imgW, fovx);
                             const R_base = [[1,0,0],[0,-1,0],[0,0,-1]];
                             const R = matMul(Rz(deg2rad(yv)), matMul(Rx(deg2rad(pv)), matMul(Ry(deg2rad(-rv)), R_base)));
                             const d_cam = normalize([0,0,1]);
@@ -352,13 +343,142 @@ export default function PixelToMapNoCanvas({
 
         cand.sort((a,b)=>a.score-b.score);
         const best = cand[0];
-        if (!isFinite(best.score)) {
-            setOut("Auto-fix: no valid ground intersection. Check AMSL/AGL.");
-            return;
-        }
+        if (!isFinite(best.score)) { setOut("Auto-fix: no valid ground intersection. Check AMSL/AGL."); return; }
         setYaw(best.yaw); setPitch(best.pitch); setRoll(best.roll);
         setOut(`Auto-fix → yaw=${best.yaw.toFixed(3)}  pitch=${best.pitch.toFixed(3)}  roll=${best.roll.toFixed(3)}`);
     }
+
+    // ------------ DEM loader & sampler (offline) ------------
+    async function loadDEM(file: File) {
+        try {
+            const buf = await file.arrayBuffer();
+            const t = await fromArrayBuffer(buf);
+            const img = await t.getImage(); // first image
+            const width = img.getWidth();
+            const height = img.getHeight();
+
+            // Spatial info
+            // Prefer ModelTiepoint/ModelPixelScale (classic GeoTIFF)
+            const tie = img.getTiePoints();
+            const scale = img.getFileDirectory().ModelPixelScale; // [resX, resY, resZ]
+            const geoKeys = img.getGeoKeys?.() as any;
+            const noData = (img as any).fileDirectory?.GDAL_NODATA
+                ? parseFloat((img as any).fileDirectory.GDAL_NODATA)
+                : undefined;
+
+            let originX: number | undefined;
+            let originY: number | undefined;
+            let resX: number | undefined;
+            let resY: number | undefined;
+
+            if (tie && tie.length > 0 && scale && scale.length >= 2) {
+                // Common case: one tiepoint at (0,0)->(lon0,lat0)
+                const tp0 = tie[0];
+                originX = tp0.x;
+                originY = tp0.y;
+                resX = scale[0];
+                resY = -Math.abs(scale[1]); // enforce north-up negative step
+            } else if ((img as any).getOrigin && (img as any).getResolution) {
+                // Some geotiff.js builds have helpers
+                const [ox, oy] = (img as any).getOrigin();
+                const [rx, ry] = (img as any).getResolution();
+                originX = ox; originY = oy; resX = rx; resY = ry;
+            } else {
+                throw new Error("DEM GeoTIFF missing tiepoints/pixel scale; cannot geolocate.");
+            }
+
+            // CRS check (best-effort)
+            const gtype = geoKeys?.GeographicTypeGeoKey;
+            const is4326 = (gtype === 4326) || (geoKeys?.ProjectedCSTypeGeoKey === 4326);
+            const unit = geoKeys?.VerticalUnits ? "metre" : "metre";
+
+            const summary = `DEM loaded: ${file.name}
+size=${width}x${height}
+origin(lon,lat)=(${originX?.toFixed(6)}, ${originY?.toFixed(6)})
+res(deg)=(${resX}, ${resY})
+CRS≈${is4326 ? "EPSG:4326" : "unknown"}
+noData=${noData ?? "n/a"}`;
+
+            setDem({
+                tiff: t, img, width, height,
+                originX, originY, resX, resY,
+                noData: Number.isFinite(noData) ? (noData as number) : null,
+                isGeographic4326: !!is4326,
+                unit, summary
+            });
+
+            setOut(prev => prev + `\n${summary}`);
+        } catch (err: any) {
+            setDem(null);
+            setOut(`DEM load failed: ${err?.message || String(err)}`);
+        }
+    }
+
+    // map (lat,lon) -> DEM row/col (floating)
+    function demLatLonToRC(d: NonNullable<DemState>, latDeg: number, lonDeg: number) {
+        if (!d.originX || !d.originY || !d.resX || !d.resY) return null;
+        // GeoTIFF north-up: lon = originX + col*resX ; lat = originY + row*resY
+        const col = (lonDeg - d.originX) / d.resX;
+        const row = (latDeg - d.originY) / d.resY; // resY is negative -> rows increase southward
+        return { row, col };
+    }
+
+    // bilinear sample with nodata handling
+    async function sampleDEM_AMSL(latDeg: number, lonDeg: number): Promise<number | null> {
+        if (!dem?.img || dem.width === undefined || dem.height === undefined) return null;
+        const rc = demLatLonToRC(dem, latDeg, lonDeg);
+        if (!rc) return null;
+
+        const { row, col } = rc;
+        const r0 = Math.floor(row), c0 = Math.floor(col);
+        if (r0 < 0 || r0 >= (dem.height - 1) || c0 < 0 || c0 >= (dem.width - 1)) return null;
+
+        // Read a 2x2 window efficiently
+        const winW = 2, winH = 2;
+        const window = [c0, r0, c0 + winW, r0 + winH] as [number, number, number, number];
+        const ras = await dem.img.readRasters({ window, width: winW, height: winH, interleave: true }) as Float32Array | number[];
+        const z00 = ras[0], z10 = ras[1], z01 = ras[2], z11 = ras[3];
+
+        // nodata check
+        const nd = dem.noData;
+        function ok(v: number) { return Number.isFinite(v) && (nd === null || v !== nd); }
+        if (!ok(z00) || !ok(z10) || !ok(z01) || !ok(z11)) {
+            // fall back: nearest neighbor on valid
+            const candidates = [z00, z10, z01, z11].filter(ok) as number[];
+            if (!candidates.length) return null;
+            return candidates[0];
+        }
+
+        const dx = col - c0;
+        const dy = row - r0;
+        // bilinear
+        const z0 = z00*(1-dx) + z10*dx;
+        const z1 = z01*(1-dx) + z11*dx;
+        const z = z0*(1-dy) + z1*dy;
+        // return z;
+        return z + DEM_OFFSET_M; // 🟢 ուղղում ենք DEM ground altitude՝ +30 մ
+
+    }
+
+    // Convenience: link AMSL↔AGL using DEM at camera lat/lon
+    async function relinkAGLWithDEM() {
+        if (!dem || !Number.isFinite(lat) || !Number.isFinite(lon)) return;
+        const z = await sampleDEM_AMSL(lat, lon);
+        if (z === null) { setOut(prev=>prev + `\nDEM sample failed at camera GPS.`); return; }
+        setGroundAlt(z);
+        if (Number.isFinite(alt_m)) setAgl(alt_m - z);
+        setOut(prev=>prev + `\nDEM@Cam: groundAlt=${z.toFixed(2)} m AMSL → AGL=${(alt_m - z).toFixed(2)} m`);
+    }
+
+    // If user toggles auto-sample and we have DEM + valid lat/lon/alt, relink.
+    useEffect(() => {
+        (async () => {
+            if (autoSampleDEM && dem && Number.isFinite(lat) && Number.isFinite(lon) && Number.isFinite(alt_m)) {
+                await relinkAGLWithDEM();
+            }
+        })();
+        // eslint-disable-next-line react-hooks/exhaustive-deps
+    }, [autoSampleDEM, dem, lat, lon, alt_m]);
 
     // ------------ file load + metadata parse ------------
     async function loadFile(f: File) {
@@ -378,44 +498,24 @@ export default function PixelToMapNoCanvas({
 
             try {
                 const meta: any = await exifr.parse(f, {
-                    xmp: true,
-                    icc: false,
-                    tiff: true,
-                    jfif: true,
-                    ihdr: true,
-                    userComment: true,
-                    makerNote: true,
-                    multiSegment: true,
+                    xmp: true, icc: false, tiff: true, jfif: true, ihdr: true,
+                    userComment: true, makerNote: true, multiSegment: true,
                 });
                 setMetaDump(meta ?? {});
-                // Orientation
-                const ori =
-                    meta.CameraOrientation ??
-                    meta.Orientation ??
-                    meta["IFD0:Orientation"] ??
-                    meta["orientation"];
+                const ori = meta.CameraOrientation ?? meta.Orientation ?? meta["IFD0:Orientation"] ?? meta["orientation"];
                 setOrientation(String(ori ?? "Horizontal (normal)"));
 
-                // ---- Robust UserComment decode (Sony often stores bytes) ----
+                // UserComment robust decode
                 let userComment = "";
-                const ucRaw =
-                    meta.UserComment ??
-                    meta.userComment ??
-                    meta["User Comment"] ??
-                    meta.makerNote;
+                const ucRaw = meta.UserComment ?? meta.userComment ?? meta["User Comment"] ?? meta.makerNote;
                 if (ucRaw) {
-                    if (typeof ucRaw === "string") {
-                        userComment = ucRaw;
-                    } else if (ucRaw instanceof Uint8Array || Array.isArray(ucRaw)) {
+                    if (typeof ucRaw === "string") userComment = ucRaw;
+                    else if (ucRaw instanceof Uint8Array || Array.isArray(ucRaw)) {
                         try {
                             const bytes = ucRaw instanceof Uint8Array ? ucRaw : new Uint8Array(ucRaw as any);
-                            // Drop "ASCII\0\0\0" header if present
                             let start = 0;
                             if (bytes.length >= 8 &&
-                                bytes[0]===0x41 && bytes[1]===0x53 && bytes[2]===0x43 && bytes[3]===0x49 && bytes[4]===0x49) {
-                                start = 8;
-                            }
-                            // try ascii then utf-8
+                                bytes[0]===0x41 && bytes[1]===0x53 && bytes[2]===0x43 && bytes[3]===0x49 && bytes[4]===0x49) start = 8; // "ASCII\0\0\0"
                             userComment = new TextDecoder("ascii").decode(bytes.slice(start)).trim();
                             if (!/Lat|Lon|Pitch|Roll|Yaw/i.test(userComment)) {
                                 userComment = new TextDecoder("utf-8").decode(bytes.slice(start)).trim();
@@ -423,9 +523,9 @@ export default function PixelToMapNoCanvas({
                         } catch { userComment = ""; }
                     }
                 }
-                const kc = parseUserComment(userComment); // lat, lon, pitch, roll, yaw?
+                const kc = parseUserComment(userComment);
 
-                // Latitude/Longitude
+                // GPS
                 const latRef = meta.GPSLatitudeRef ?? meta.gpslatituderef ?? "N";
                 const lonRef = meta.GPSLongitudeRef ?? meta.gpslongituderef ?? "E";
                 const mLat = kc.lat ?? pickFirst<number>(meta, ["GPSLatitude", "latitude"], (v)=>toDecimalDegrees(v, latRef));
@@ -433,54 +533,42 @@ export default function PixelToMapNoCanvas({
                 if (Number.isFinite(mLat)) setLat(mLat as number);
                 if (Number.isFinite(mLon)) setLon(mLon as number);
 
-                // Absolute altitude (AMSL) and RelativeAltitude (DJI) → AGL
+                // Altitudes
                 const absAltPref =
                     numberFromMixedString(pickFirst(meta, ["AbsoluteAltitude"])) ??
                     numberFromMixedString(pickFirst(meta, ["GPSAltitude", "altitude"]));
                 const relAlt = numberFromMixedString(pickFirst(meta, ["RelativeAltitude"]));
-
                 if (Number.isFinite(absAltPref)) setAlt(absAltPref as number);
                 if (Number.isFinite(relAlt)) {
                     setAgl(relAlt as number);
                     if (Number.isFinite(absAltPref)) setGroundAlt((absAltPref as number) - (relAlt as number));
                 } else {
+                    // If DEM is present we’ll relink later; else minimal fallback
                     const initAGL = (agl && agl>0) ? agl : 2;
-                    setAgl(initAGL);
-                    if (Number.isFinite(absAltPref)) setGroundAlt((absAltPref as number) - initAGL);
+                    if (Number.isFinite(absAltPref)) {
+                        setAgl(initAGL);
+                        setGroundAlt((absAltPref as number) - initAGL);
+                    }
                 }
 
-                // Attitude: prefer DJI keys; else Sony UserComment
-                const yawPref =
-                    numberFromMixedString(pickFirst(meta, ["GimbalYawDegree","FlightYawDegree","CameraYaw","Yaw"])) ??
-                    kc.yaw;
-                const pitchPref =
-                    numberFromMixedString(pickFirst(meta, ["GimbalPitchDegree","FlightPitchDegree","CameraPitch","Pitch"])) ??
-                    kc.pitch;
-                const rollPref =
-                    numberFromMixedString(pickFirst(meta, ["GimbalRollDegree","FlightRollDegree","CameraRoll","Roll"])) ??
-                    kc.roll;
-
+                // Attitude
+                const yawPref = numberFromMixedString(pickFirst(meta, ["GimbalYawDegree","FlightYawDegree","CameraYaw","Yaw"])) ?? kc.yaw;
+                const pitchPref = numberFromMixedString(pickFirst(meta, ["GimbalPitchDegree","FlightPitchDegree","CameraPitch","Pitch"])) ?? kc.pitch;
+                const rollPref  = numberFromMixedString(pickFirst(meta, ["GimbalRollDegree","FlightRollDegree","CameraRoll","Roll"])) ?? kc.roll;
                 if (Number.isFinite(yawPref))   setYaw(yawPref as number);
                 if (Number.isFinite(pitchPref)) setPitch(pitchPref as number);
                 if (Number.isFinite(rollPref))  setRoll(rollPref as number);
 
-                // ------ FOV / intrinsics ------
-                // 1) Explicit FOV
-                let fovxDeg =
-                    numberFromMixedString(pickFirst(meta, ["FOV","HFOV","HorizontalFOV"])) ?? undefined;
+                // Intrinsics
+                let fovxDeg = numberFromMixedString(pickFirst(meta, ["FOV","HFOV","HorizontalFOV"])) ?? undefined;
 
-                // 2) 35mm equivalent
                 if (!Number.isFinite(fovxDeg)) {
-                    const f35 = numberFromMixedString(
-                        pickFirst(meta, ["FocalLengthIn35mmFormat","ExifIFD:FocalLengthIn35mmFilm"])
-                    );
+                    const f35 = numberFromMixedString(pickFirst(meta, ["FocalLengthIn35mmFormat","ExifIFD:FocalLengthIn35mmFilm"]));
                     if (Number.isFinite(f35) && (f35 as number) > 0) {
                         const fx35 = (Number(f35) / 36) * img.naturalWidth;
                         setFx(fx35); setFy(fx35);
                     }
                 }
-
-                // 3) FocalLength (mm) + sensor width
                 if ((!fx || !fy) || (fx===0 && fy===0)) {
                     const fmm = numberFromMixedString(pickFirst(meta, ["FocalLength"]));
                     const model = String(meta.Model || "");
@@ -493,8 +581,6 @@ export default function PixelToMapNoCanvas({
                         setFx(_fx); setFy(_fx);
                     }
                 }
-
-                // 4) manual FOV fallback
                 if ((!fx || !fy) || (fx===0 && fy===0)) {
                     const _fx = fxFromFovX(img.naturalWidth, fovx || 63);
                     setFx(_fx); setFy(_fx); setCx(img.naturalWidth/2); setCy(img.naturalHeight/2);
@@ -503,17 +589,22 @@ export default function PixelToMapNoCanvas({
                     if (!Number.isFinite(cy) || !cy) setCy(img.naturalHeight / 2);
                 }
 
-                setOut("Metadata parsed. Click the image to compute ground point.");
+                setOut("Մետատվյալները կարդացված են. սեղմիր պատկերին՝ գետնի կետը հաշվարկելու համար։");
+
+                // If DEM is loaded and we have lat/lon/alt, auto link
+                if (autoSampleDEM && dem && Number.isFinite(mLat) && Number.isFinite(mLon) && Number.isFinite(absAltPref)) {
+                    await relinkAGLWithDEM();
+                }
             } catch (e) {
                 const _fx = fxFromFovX(img.naturalWidth, fovx || 63);
                 setFx(_fx); setFy(_fx); setCx(img.naturalWidth/2); setCy(img.naturalHeight/2);
-                setOut("No readable metadata. Using FOVx fallback. Fill pose/alt/groundAlt (or AGL) and click on image.");
+                setOut("Մետատվյալ չհաջողվեց կարդալ. օգտագործում ենք FOVx fallback. Լրացրու pose/alt/groundAlt/AGL և սեղմիր պատկերին։");
             }
         };
         img.src = url;
     }
 
-    // ------------ draw metrics (contain + zoom/pan) ------------
+    // ------------ draw metrics ------------
     function getDrawMetrics(which: "preview" | "viewer") {
         const host = which === "preview" ? previewRef.current : viewerRef.current;
         if (!host || !imgW || !imgH) return null;
@@ -527,7 +618,7 @@ export default function PixelToMapNoCanvas({
         return { contW, contH, baseS, S, drawW, drawH, offX, offY };
     }
 
-    // ------------ image interactions ------------
+    // ------------ interactions ------------
     function pickUV(e: React.MouseEvent, which: "preview" | "viewer") {
         if (!imgEl) return null;
         const host = which === "preview" ? previewRef.current : viewerRef.current;
@@ -544,14 +635,20 @@ export default function PixelToMapNoCanvas({
     const onMove: React.MouseEventHandler<HTMLDivElement> = (e) => {
         if (panning && panStartRef.current && viewerRef.current) {
             const rect = viewerRef.current.getBoundingClientRect();
-            const x = e.clientX - rect.left, y = e.clientY - rect.top;
-            const dx = x - panStartRef.current.x, dy = y - panStartRef.current.y;
-            setTx(panStartRef.current.tx + dx); setTy(panStartRef.current.ty + dy);
+            const x = e.clientX - rect.left;
+            const y = e.clientY - rect.top;
+            const dx = x - panStartRef.current.x;
+            const dy = y - panStartRef.current.y;
+            setTx(panStartRef.current.tx + dx);
+            setTy(panStartRef.current.ty + dy);
             return;
         }
         const uv = pickUV(e, "viewer");
         setPixelStr(uv ? `pixel: (${Math.round(uv.u)}, ${Math.round(uv.v)})` : "");
+        if (uv) setCursorPos({ x: uv.x, y: uv.y }); // 👈 պահում ենք խաչի դիրքը
     };
+
+
     const onMouseDown: React.MouseEventHandler<HTMLDivElement> = (e) => {
         if (!viewerRef.current) return;
         const rect = viewerRef.current.getBoundingClientRect();
@@ -560,7 +657,8 @@ export default function PixelToMapNoCanvas({
         setPanning(true);
     };
     const onMouseUp: React.MouseEventHandler<HTMLDivElement> = () => { setPanning(false); panStartRef.current = null; };
-    const onMouseLeave: React.MouseEventHandler<HTMLDivElement> = () => { setPanning(false); panStartRef.current = null; };
+    const onMouseLeave: React.MouseEventHandler<HTMLDivElement> = () => { setPanning(false); setCursorPos(null);};
+
 
     const onWheel: React.WheelEventHandler<HTMLDivElement> = (e) => {
         if (!imgEl) return;
@@ -579,14 +677,24 @@ export default function PixelToMapNoCanvas({
         setScale(newScale); setTx(txPrime); setTy(tyPrime);
     };
 
-    const onClickCompute: React.MouseEventHandler<HTMLDivElement> = (e) => {
+    const onClickCompute: React.MouseEventHandler<HTMLDivElement> = async (e) => {
         if (!imgEl) { setOut("Load an image first."); return; }
         const uv = pickUV(e, "viewer");
         if (!uv) { setOut("Click is outside image."); return; }
         if (!Number.isFinite(lat) || !Number.isFinite(lon)) { setOut("No GPS in metadata. Fill Latitude/Longitude first."); return; }
 
-        // AMSL/AGL linkage
-        if (Number.isFinite(alt_m) && Number.isFinite(agl)) setGroundAlt(alt_m - agl);
+        // If DEM present and opted-in, (re)sample ground at camera GPS
+        if (autoSampleDEM && dem) {
+            const z = await sampleDEM_AMSL(lat, lon);
+            if (z !== null) {
+                setGroundAlt(z);
+                if (Number.isFinite(alt_m)) setAgl(alt_m - z);
+            }
+        } else {
+            // If no DEM, keep manual linkage
+            if (Number.isFinite(alt_m) && Number.isFinite(agl)) setGroundAlt(alt_m - agl);
+        }
+
         if (!Number.isFinite(alt_m) || !Number.isFinite(groundAlt)) {
             setOut("Set Altitude (AMSL) and either Ground Alt (AMSL) or Height AGL.");
             return;
@@ -595,14 +703,12 @@ export default function PixelToMapNoCanvas({
         const hit = project(uv.u, uv.v) as any;
         if (!hit) { setOut("Ray didn’t hit the ground plane (up/behind). Check AMSL/AGL or pose."); return; }
 
-        // Construct outputs
         const decLat = hit.lat;
         const decLon = hit.lon;
         const dmsLat = toDMS(decLat, true);
         const dmsLon = toDMS(decLon, false);
-        const gePoint = toGoogleEarthCoord(decLon, decLat, groundAlt); // lon,lat,alt
+        const gePoint = toGoogleEarthCoord(decLon, decLat, groundAlt);
 
-        // Add to list
         const id = Date.now();
         const name = `P${nameCounter}`;
         setNameCounter(c => c + 1);
@@ -623,6 +729,7 @@ export default function PixelToMapNoCanvas({
             `yaw=${Number(yaw).toFixed(2)}°, pitch=${Number(pitch).toFixed(2)}°, roll=${Number(roll).toFixed(2)}°`,
             `fx=${Number(fx).toFixed(2)}, fy=${Number(fy).toFixed(2)}, cx=${Number(cx).toFixed(2)}, cy=${Number(cy).toFixed(2)}`,
             `orientation: ${orientation}`,
+            dem?.summary ? `DEM: ${dem.summary.split("\n")[0]}` : `DEM: (none)`,
             `Saved as ${name}.`
         ].join("\n"));
     };
@@ -635,10 +742,14 @@ export default function PixelToMapNoCanvas({
             {num("Latitude (°)", lat, setLat, 1e-7)}
             {num("Longitude (°)", lon, setLon, 1e-7)}
             {num("Altitude (m, AMSL)", alt_m, (v)=>{ setAlt(v); setGroundAlt(v - agl); })}
+
             <div className={s.grid2}>
                 {num("Ground Alt (m, AMSL)", groundAlt, (v)=>{ setGroundAlt(v); setAgl(alt_m - v); })}
                 {num("Height AGL (m)", agl, (v)=>{ setAgl(v); setGroundAlt(alt_m - v); })}
+
             </div>
+
+
             {num("Yaw (°)", yaw, setYaw, 0.01)}
             {num("Pitch (°, +down)", pitch, setPitch, 0.01)}
             {num("Roll (°, +right)", roll, setRoll, 0.01)}
@@ -665,56 +776,72 @@ export default function PixelToMapNoCanvas({
         </>
     );
 
+
+    const DEMBlock = (
+        <>
+            <h3 className={s.h3}>Offline Ground Elevation (DEM)</h3>
+            <div className={s.monoDim}>
+                DEM GeoTIFF (օր. SRTM/ASTER, EPSG:4326),։
+            </div>
+            <div className={s.rowBtns}>
+                <input
+                    type="file"
+                    accept=".tif,.tiff,image/tiff,application/octet-stream"
+                    onChange={(e)=>{
+                        const f = e.target.files?.[0];
+                        if (f) loadDEM(f);
+                    }}
+                />
+                <label className={s.chk}>
+                    <input type="checkbox" checked={autoSampleDEM} onChange={(e)=>setAutoSampleDEM(e.target.checked)} />
+                    Auto-sample DEM @ camera GPS (link AMSL↔AGL)
+                </label>
+                <button className={s.btn} onClick={relinkAGLWithDEM} disabled={!dem || !Number.isFinite(lat) || !Number.isFinite(lon)}>
+                    Sample now @ (lat,lon)
+                </button>
+            </div>
+            <pre className={s.preSmall}>{dem?.summary || "— DEM not loaded —"}</pre>
+            {!dem?.isGeographic4326 && dem && (
+                <div className={s.warn}>⚠ DEM CRS անծանոթ է (կամ ոչ EPSG:4326). Արդյունքը կարող է լինել սխալ, ցանկալի է 4326 GeoTIFF։</div>
+            )}
+        </>
+    );
+
     const GoogleEarthTools = (
         <>
             <h3 className={s.h3}>Google Earth / KML</h3>
-            <div className={s.monoDim}>Each click saves a point (lon,lat,alt=ground AMSL). Export all as KML or copy formats.</div>
+            <div className={s.monoDim}>(lon,lat,alt=ground AMSL)։</div>
             <div className={s.rowBtns}>
-                <button
-                    className={s.btn}
-                    onClick={()=>{
-                        if (!points.length) { setOut("No points to export."); return; }
-                        const kml = buildKML(points);
-                        download("aw_points.kml", kml);
-                        setOut(prev=>prev + `\nExported ${points.length} point(s) to aw_points.kml`);
-                    }}
-                >Download KML</button>
-                <button
-                    className={s.btn}
-                    onClick={()=>{
-                        if (!points.length) { setOut("No points to copy."); return; }
-                        const last = points[points.length - 1];
-                        const s = toGoogleEarthCoord(last.lon, last.lat, last.groundAltAMSL);
-                        copy(s);
-                    }}
-                >Copy last (lon,lat,alt)</button>
-                <button
-                    className={s.btn}
-                    onClick={()=>{
-                        if (!points.length) { setOut("No points to copy."); return; }
-                        const last = points[points.length - 1];
-                        copy(`${last.lat.toFixed(7)}, ${last.lon.toFixed(7)}`);
-                    }}
-                >Copy last (lat, lon)</button>
-                <button
-                    className={s.btn}
-                    onClick={()=>{
-                        if (!points.length) { setOut("No points to copy."); return; }
-                        const last = points[points.length - 1];
-                        copy(`${toDMS(last.lat,true)}  ${toDMS(last.lon,false)}`);
-                    }}
-                >Copy last (DMS)</button>
-                <button
-                    className={s.btnDanger}
-                    onClick={()=>{ setPoints([]); setOut("Cleared points."); }}
-                >Clear points</button>
+                <button className={s.btn} onClick={()=>{
+                    if (!points.length) { setOut("No points to export."); return; }
+                    const kml = buildKML(points);
+                    download("aw_points.kml", kml);
+                    setOut(prev=>prev + `\nExported ${points.length} point(s) to aw_points.kml`);
+                }}>Download KML</button>
+                <button className={s.btn} onClick={()=>{
+                    if (!points.length) { setOut("No points to copy."); return; }
+                    const last = points[points.length - 1];
+                    copy(toGoogleEarthCoord(last.lon, last.lat, last.groundAltAMSL));
+                }}>Copy last (lon,lat,alt)</button>
+                <button className={s.btn} onClick={()=>{
+                    if (!points.length) { setOut("No points to copy."); return; }
+                    const last = points[points.length - 1];
+                    copy(`${last.lat.toFixed(7)}, ${last.lon.toFixed(7)}`);
+                }}>Copy last (lat, lon)</button>
+                <button className={s.btn} onClick={()=>{
+                    if (!points.length) { setOut("No points to copy."); return; }
+                    const last = points[points.length - 1];
+                    copy(`${toDMS(last.lat,true)}  ${toDMS(last.lon,false)}`);
+                }}>Copy last (DMS)</button>
+                <button className={s.btnDanger} onClick={()=>{ setPoints([]); setOut("Cleared points."); }}>Clear points</button>
             </div>
 
             <div className={s.pointsTableWrap}>
                 <table className={s.tbl}>
                     <thead>
                     <tr>
-                        <th>#</th><th>Name</th><th>Pixel(u,v)</th><th>Lat</th><th>Lon</th><th>Alt(AMSL)</th><th>Ground(AMSL)</th><th>AGL</th><th>GE coord</th>
+                        <th>#</th><th>Name</th><th>Pixel(u,v)</th><th>Lat</th><th>Lon</th>
+                        <th>Alt(AMSL)</th><th>Ground(AMSL)</th><th>AGL</th><th>GE coord</th>
                     </tr>
                     </thead>
                     <tbody>
@@ -795,6 +922,9 @@ export default function PixelToMapNoCanvas({
                         </>)}
                     </div>
                     <div className={s.monoDim}>zoom: preview</div>
+
+                    <div className={s.sep} />
+                    {DEMBlock}
                 </div>
 
                 {/* Middle */}
@@ -822,16 +952,19 @@ export default function PixelToMapNoCanvas({
 
                         <div className={s.modalBody}>
                             <div className={s.imagePane}>
-                                <div ref={viewerRef}
-                                     className={`${s.viewer} ${panning ? s.grabbing : s.crosshair}`}
-                                     onMouseMove={onMove}
-                                     onMouseDown={onMouseDown}
-                                     onMouseUp={onMouseUp}
-                                     onMouseLeave={onMouseLeave}
-                                     onWheel={onWheel}
-                                     onClick={onClickCompute}
-                                     onDoubleClick={onDoubleClick}>
+                                <div
+                                    ref={viewerRef}
+                                    className={`${s.viewer} ${panning ? s.grabbing : s.cursorPos}`}
+                                    onMouseMove={onMove}
+                                    onMouseDown={onMouseDown}
+                                    onMouseUp={onMouseUp}
+                                    onMouseLeave={onMouseLeave}
+                                    onWheel={onWheel}
+                                    onClick={onClickCompute}
+                                    onDoubleClick={onDoubleClick}
+                                >
                                     {blobUrl && <ZoomedImage src={blobUrl} imgW={imgW} imgH={imgH} scale={scale} tx={tx} ty={ty} />}
+                                    {cursorPos && <div className={s.aim} style={{ left: cursorPos.x, top: cursorPos.y }} />}
                                 </div>
                                 <div className={s.monoBright}>{pixelStr} · zoom: {scale.toFixed(2)}</div>
                             </div>
@@ -845,11 +978,12 @@ export default function PixelToMapNoCanvas({
                     </div>
                 </div>
             )}
+
         </>
     );
 }
 
-// ---- small inputs ----
+// ---- inputs ----
 function num(label: string, value: number, set: (v: number) => void, step: number = 1) {
     return (
         <label className={s.lbl}>
