@@ -15,7 +15,7 @@ import s from "./PixelToMapNoCanvas.module.scss";
 
 // --- sensor widths for FOV estimation ---
 const SENSOR_WIDTH_MM_BY_MODEL: Record<string, number> = { "ILCE-5100": 23.5, "ILCE-6000": 23.5, "ILCE-6100": 23.5, "ILCE-6300": 23.5, "ILCE-6400": 23.5, };
-const DEM_OFFSET_M = 34
+const DEM_OFFSET_M = 30
 type HitPoint = {
     id: number;
     name: string;
@@ -128,6 +128,163 @@ export default function PixelToMapNoCanvas({
         const half = Math.tan(deg2rad((fovx_deg || 1e-6)/2));
         return W/2 / Math.max(half, 1e-9);
     }
+
+
+
+    // ---- Download annotated full-res image (PNG) ----
+    // scale factor ըստ full-res լայնքի (կրկնակի չանցնենք)
+    function markerScale() {
+        if (!imgW) return 1;
+        return Math.max(1, Math.min(imgW / 4000, 2.2));
+    }
+
+// ---- Download annotated full-res image (PNG) ----
+    async function downloadAnnotatedImage(filename = "Aw-img.png") {
+        if (!imgEl || !imgW || !imgH) { setOut("Load an image first."); return; }
+
+        const s = markerScale();                  // 👈 օգտագործենք նշանների չափերի համար
+        const canvas = document.createElement("canvas");
+        canvas.width = imgW;
+        canvas.height = imgH;
+        const ctx = canvas.getContext("2d")!;
+        ctx.imageSmoothingEnabled = true;
+        ctx.imageSmoothingQuality = "high";
+
+        // draw base image
+        if (imgEl.complete) ctx.drawImage(imgEl, 0, 0, imgW, imgH);
+        else await new Promise<void>(r => (imgEl.onload = () => { ctx.drawImage(imgEl,0,0,imgW,imgH); r(); }));
+
+        // draw points — հիմա ավելի մեծ
+        points.forEach((p, idx) => drawMarker(ctx, p.pixelU, p.pixelV, idx + 1, s));
+
+        // download proper filename (STRING!)
+        const url = canvas.toDataURL("image/png");
+        const a = document.createElement("a");
+        a.href = url;
+        a.download = String(filename);            // 👈 պարտադիր string, թե չէ կլինի [object Object]
+        document.body.appendChild(a);
+        a.click();
+        a.remove();
+    }
+
+// ---- marker painter (bolder / bigger) ----
+    function drawMarker(
+        ctx: CanvasRenderingContext2D,
+        u: number, v: number, idx: number, s = 1
+    ) {
+        const box = 22 * s;            // ⬆️ from 16 → 22
+        const half = box / 2;
+        const r = 6 * s;               // corner radius
+        const dot = 5 * s;             // center dot
+        const lw = 4 * s;              // line width
+        const tagH = 20 * s;           // label height
+        const padX = 7 * s;
+
+        ctx.save();
+        ctx.translate(u, v);
+
+        // red square
+        ctx.strokeStyle = "#ff2d2d";
+        ctx.lineWidth = lw;
+        ctx.fillStyle = "rgba(255,75,75,.18)";
+        roundRect(ctx, -half, -half, box, box, r);
+        ctx.fill();
+        ctx.stroke();
+
+        // center dot
+        ctx.fillStyle = "#ff2d2d";
+        ctx.beginPath();
+        ctx.arc(0, 0, dot, 0, Math.PI * 2);
+        ctx.fill();
+
+        // tag above
+        const txt = String(idx);
+        ctx.font = `700 ${Math.round(16 * s)}px ui-monospace, Menlo, Consolas, monospace`;
+        ctx.textAlign = "center";
+        ctx.textBaseline = "middle";
+        const w = ctx.measureText(txt).width + padX * 2;
+        const y0 = -(half + 8 * s + tagH);
+        ctx.fillStyle = "#ff2d2d";
+        roundRect(ctx, -w / 2, y0, w, tagH, 6 * s);
+        ctx.fill();
+        ctx.fillStyle = "#fff";
+        ctx.fillText(txt, 0, y0 + tagH / 2);
+
+        ctx.restore();
+    }
+
+    function roundRect(ctx: CanvasRenderingContext2D, x:number,y:number,w:number,h:number,r:number){
+        const rr = Math.min(r, w/2, h/2);
+        ctx.beginPath();
+        ctx.moveTo(x+rr,y);
+        ctx.lineTo(x+w-rr,y);
+        ctx.quadraticCurveTo(x+w,y,x+w,y+rr);
+        ctx.lineTo(x+w,y+h-rr);
+        ctx.quadraticCurveTo(x+w,y+h,x+w-rr,y+h);
+        ctx.lineTo(x+rr,y+h);
+        ctx.quadraticCurveTo(x,y+h,x,y+h-rr);
+        ctx.lineTo(x,y+rr);
+        ctx.quadraticCurveTo(x,y,x+rr,y);
+    }
+
+// ---- marker painter (matches your UI style) ----
+    function drawMarker(ctx: CanvasRenderingContext2D, u: number, v: number, idx: number) {
+        const box = 16;                   // square size in px
+        const half = box / 2;
+        ctx.save();
+        ctx.translate(u, v);
+
+        // red square
+        ctx.strokeStyle = "#ff2d2d";
+        ctx.lineWidth = 3;
+        ctx.fillStyle = "rgba(255,75,75,.12)";
+        roundRect(ctx, -half, -half, box, box, 5);
+        ctx.fill();
+        ctx.stroke();
+
+        // center dot
+        ctx.fillStyle = "#ff2d2d";
+        ctx.beginPath();
+        ctx.arc(0, 0, 3.5, 0, Math.PI * 2);
+        ctx.fill();
+
+        // tag above
+        const txt = String(idx);
+        ctx.font = "700 14px ui-monospace, Menlo, Consolas, monospace";
+        ctx.textAlign = "center";
+        ctx.textBaseline = "middle";
+        const padX = 6, padY = 3, h = 18;
+        const w = ctx.measureText(txt).width + padX * 2;
+        const y0 = -(half + 6 + h);
+
+        ctx.fillStyle = "#ff2d2d";
+        roundRect(ctx, -w / 2, y0, w, h, 6);
+        ctx.fill();
+
+        ctx.fillStyle = "#fff";
+        ctx.fillText(txt, 0, y0 + h / 2);
+
+        ctx.restore();
+    }
+
+// ---- small rounded-rect helper ----
+    function roundRect(ctx: CanvasRenderingContext2D, x: number, y: number, w: number, h: number, r: number) {
+        const rr = Math.min(r, w / 2, h / 2);
+        ctx.beginPath();
+        ctx.moveTo(x + rr, y);
+        ctx.lineTo(x + w - rr, y);
+        ctx.quadraticCurveTo(x + w, y, x + w, y + rr);
+        ctx.lineTo(x + w, y + h - rr);
+        ctx.quadraticCurveTo(x + w, y + h, x + w - rr, y + h);
+        ctx.lineTo(x + rr, y + h);
+        ctx.quadraticCurveTo(x, y + h, x, y + h - rr);
+        ctx.lineTo(x, y + rr);
+        ctx.quadraticCurveTo(x, y, x + rr, y);
+        // caller decides fill/stroke
+    }
+
+
+
 
     // ------------ format helpers ------------
     function toDMS(value: number, isLat: boolean) {
@@ -307,6 +464,15 @@ export default function PixelToMapNoCanvas({
         const { mlat, mlon } = metersPerDeg(baseLat);
         return { lat: baseLat + yN / mlat, lon: baseLon + xE / mlon, range: Math.hypot(xE, yN) };
     }
+
+    // image (u,v) -> current viewer screen (x,y)
+    function imgUVtoScreen(u: number, v: number, which: "preview" | "viewer") {
+        const m = getDrawMetrics(which);
+        if (!m) return null;
+        return { x: m.offX + u * m.S, y: m.offY + v * m.S };
+    }
+
+
 
     // ------------ Auto-fix pose (sign opps) ------------
     function autoFixPose() {
@@ -608,15 +774,25 @@ noData=${noData ?? "n/a"}`;
     function getDrawMetrics(which: "preview" | "viewer") {
         const host = which === "preview" ? previewRef.current : viewerRef.current;
         if (!host || !imgW || !imgH) return null;
+
         const rect = host.getBoundingClientRect();
         const contW = rect.width, contH = rect.height;
+
         const baseS = Math.min(contW / imgW, contH / imgH);
-        const S = baseS * scale;
+
+        // 👇 preview-ում միշտ առանց viewer-ի zoom/pan-ի
+        const useScale = (which === "viewer") ? scale : 1;
+        const useTx    = (which === "viewer") ? tx    : 0;
+        const useTy    = (which === "viewer") ? ty    : 0;
+
+        const S = baseS * useScale;
         const drawW = imgW * S, drawH = imgH * S;
-        const offX = (contW - drawW) / 2 + tx;
-        const offY = (contH - drawH) / 2 + ty;
+        const offX = (contW - drawW) / 2 + useTx;
+        const offY = (contH - drawH) / 2 + useTy;
+
         return { contW, contH, baseS, S, drawW, drawH, offX, offY };
     }
+
 
     // ------------ interactions ------------
     function pickUV(e: React.MouseEvent, which: "preview" | "viewer") {
@@ -916,11 +1092,33 @@ noData=${noData ?? "n/a"}`;
                     <div ref={previewRef} className={s.preview}
                          onClick={()=>blobUrl && setViewerOpen(true)}
                          title={blobUrl ? "Open large viewer" : "Load an image first"}>
-                        {blobUrl && (<>
-                            <ZoomedImage src={blobUrl} imgW={imgW} imgH={imgH} scale={1} tx={0} ty={0} />
-                            <div className={s.previewOverlay}>Click to open viewer</div>
-                        </>)}
+                        {blobUrl && (
+                            <>
+                                {/* ❌ Հեռացրու duplicat ZoomedImage-ը, թող մնա միայն մեկը */}
+                                <ZoomedImage src={blobUrl} imgW={imgW} imgH={imgH} scale={1} tx={0} ty={0} />
+
+
+                                {/* ✅ Marker-ները հաշվարկիր "preview" կոնտեյների մետրիկայով */}
+                                {points.map((p, idx) => {
+                                    const pos = imgUVtoScreen(p.pixelU, p.pixelV, "preview");
+                                    if (!pos) return null;
+                                    return (
+                                        <div key={p.id} className={s.marker} style={{ left: pos.x, top: pos.y }}>
+                                            <span className={s.markerTag}>{idx + 1}</span>
+                                            <div className={s.markerBox} />
+                                        </div>
+
+                                    );
+
+                                })}
+
+                                {cursorPos && <div className={s.aim} style={{ left: cursorPos.x, top: cursorPos.y }} />}
+
+                                <div className={s.previewOverlay}>Click to open viewer</div>
+                            </>
+                        )}
                     </div>
+
                     <div className={s.monoDim}>zoom: preview</div>
 
                     <div className={s.sep} />
@@ -945,10 +1143,41 @@ noData=${noData ?? "n/a"}`;
                         <div className={s.modalHeader}>
                             <div className={s.title}>Image Viewer</div>
                             <div className={s.headerBtns}>
-                                <button onClick={()=>{ setScale(1); setTx(0); setTy(0); }} className={s.btn}>Reset</button>
-                                <button onClick={()=>setViewerOpen(false)} className={s.btn}>Close (Esc)</button>
+                                <button
+                                    className={s.btn}
+                                    title="Zoom in"
+                                    onClick={() => setScale(prev => Math.min(prev * 1.25, MAX_SCALE))}
+                                >Zoom ➕</button>
+
+                                <button
+                                    className={s.btn}
+                                    title="Zoom out"
+                                    onClick={() => setScale(prev => Math.max(prev / 1.25, MIN_SCALE))}
+                                >Zoom ➖</button>
+
+                                <button
+                                    className={s.btn}
+                                    title="Unselect all points"
+                                    onClick={() => { setPoints([]); setOut("Cleared all selected points."); }}
+                                >🧹 Clear</button>
+
+                                <button className={s.btn} onClick={()=>downloadAnnotatedImage("Aw-img.png")}>
+                                    Download image
+                                </button>
+
+
+                                <button
+                                    className={s.btn}
+                                    onClick={() => { setScale(1); setTx(0); setTy(0); }}
+                                >Reset ↺</button>
+
+                                <button
+                                    className={s.btn}
+                                    onClick={() => setViewerOpen(false)}
+                                >Close (Esc)</button>
                             </div>
                         </div>
+
 
                         <div className={s.modalBody}>
                             <div className={s.imagePane}>
@@ -964,6 +1193,18 @@ noData=${noData ?? "n/a"}`;
                                     onDoubleClick={onDoubleClick}
                                 >
                                     {blobUrl && <ZoomedImage src={blobUrl} imgW={imgW} imgH={imgH} scale={scale} tx={tx} ty={ty} />}
+
+                                    {points.map((p, idx) => {
+                                        const pos = imgUVtoScreen(p.pixelU, p.pixelV, "viewer");
+                                        if (!pos) return null;
+                                        return (
+                                            <div key={p.id} className={s.marker} style={{ left: pos.x, top: pos.y }}>
+                                                <span className={s.markerTag}>{idx + 1}</span>
+                                                <div className={s.markerBox} />
+                                            </div>
+                                        );
+                                    })}
+
                                     {cursorPos && <div className={s.aim} style={{ left: cursorPos.x, top: cursorPos.y }} />}
                                 </div>
                                 <div className={s.monoBright}>{pixelStr} · zoom: {scale.toFixed(2)}</div>
