@@ -12,6 +12,7 @@ import React, { useRef, useState, useEffect } from "react";
 import * as exifr from "exifr";
 import { fromUrl, fromArrayBuffer, GeoTIFF, GeoTIFFImage } from "geotiff";
 import s from "./PixelToMapNoCanvas.module.scss";
+import { createPortal } from "react-dom";
 
 // --- sensor widths for FOV estimation ---
 const SENSOR_WIDTH_MM_BY_MODEL: Record<string, number> = { "ILCE-5100": 23.5, "ILCE-6000": 23.5, "ILCE-6100": 23.5, "ILCE-6300": 23.5, "ILCE-6400": 23.5, };
@@ -90,6 +91,9 @@ export default function PixelToMapNoCanvas({
     const [metaDump, setMetaDump] = useState<Record<string, any> | null>(null);
     const [orientation, setOrientation] = useState<string>("Horizontal (normal)");
     const [viewerOpen, setViewerOpen] = useState(false);
+    const [open, setOpen] = useState(true); // open = true → panels visible
+    const [downloading, setDownloading] = useState(false);
+
 
     // points for KML
     const [points, setPoints] = useState<HitPoint[]>([]);
@@ -133,51 +137,89 @@ export default function PixelToMapNoCanvas({
 
     // ---- Download annotated full-res image (PNG) ----
     // scale factor ըստ full-res լայնքի (կրկնակի չանցնենք)
+// --- scale factor for downloadable PNG markers ---
     function markerScale() {
         if (!imgW) return 1;
-        return Math.max(1, Math.min(imgW / 4000, 2.2));
+        if (imgW >= 8000) return 3.0;
+        if (imgW >= 6000) return 2.5;
+        if (imgW >= 4000) return 2.0;
+        if (imgW >= 3000) return 1.6;
+        return 1.3;
     }
 
 // ---- Download annotated full-res image (PNG) ----
     async function downloadAnnotatedImage(filename = "Aw-img.png") {
         if (!imgEl || !imgW || !imgH) { setOut("Load an image first."); return; }
 
-        const s = markerScale();                  // 👈 օգտագործենք նշանների չափերի համար
-        const canvas = document.createElement("canvas");
-        canvas.width = imgW;
-        canvas.height = imgH;
-        const ctx = canvas.getContext("2d")!;
-        ctx.imageSmoothingEnabled = true;
-        ctx.imageSmoothingQuality = "high";
+        setDownloading(true); // 🟢 սկսում ենք loading-ը
+        try {
+            const s = markerScale();
+            const canvas = document.createElement("canvas");
+            canvas.width = imgW;
+            canvas.height = imgH;
+            const ctx = canvas.getContext("2d")!;
+            ctx.imageSmoothingEnabled = true;
+            ctx.imageSmoothingQuality = "high";
 
-        // draw base image
-        if (imgEl.complete) ctx.drawImage(imgEl, 0, 0, imgW, imgH);
-        else await new Promise<void>(r => (imgEl.onload = () => { ctx.drawImage(imgEl,0,0,imgW,imgH); r(); }));
+            // wait until image is fully loaded (even if still decoding)
+            await new Promise<void>((resolve, reject) => {
+                if (imgEl.complete) {
+                    resolve();
+                } else {
+                    imgEl.onload = () => resolve();
+                    imgEl.onerror = () => reject(new Error("Image failed to load"));
+                }
+            });
 
-        // draw points — հիմա ավելի մեծ
-        points.forEach((p, idx) => drawMarker(ctx, p.pixelU, p.pixelV, idx + 1, s));
+            ctx.drawImage(imgEl, 0, 0, imgW, imgH);
 
-        // download proper filename (STRING!)
-        const url = canvas.toDataURL("image/png");
-        const a = document.createElement("a");
-        a.href = url;
-        a.download = String(filename);            // 👈 պարտադիր string, թե չէ կլինի [object Object]
-        document.body.appendChild(a);
-        a.click();
-        a.remove();
+            // draw points (markers)
+            points.forEach((p, idx) => drawMarker(ctx, p.pixelU, p.pixelV, idx + 1, s));
+
+            // save
+            const url = canvas.toDataURL("image/png");
+            const a = document.createElement("a");
+            a.href = url;
+            a.download = String(filename);
+            document.body.appendChild(a);
+            a.click();
+            a.remove();
+
+            setOut(`✅ Image saved as ${filename}`);
+        } catch (err: any) {
+            console.error(err);
+            setOut("Download failed: " + (err.message || err));
+        } finally {
+            setDownloading(false); // 🔴 անջատում ենք loading-ը
+        }
     }
 
-// ---- marker painter (bolder / bigger) ----
+// ---- helpers (ONLY ONE roundRect + ONE drawMarker) ----
+    function roundRect(ctx: CanvasRenderingContext2D, x:number,y:number,w:number,h:number,r:number){
+        const rr = Math.min(r, w/2, h/2);
+        ctx.beginPath();
+        ctx.moveTo(x+rr,y);
+        ctx.lineTo(x+w-rr,y);
+        ctx.quadraticCurveTo(x+w,y,x+w,y+rr);
+        ctx.lineTo(x+w,y+h-rr);
+        ctx.quadraticCurveTo(x+w,y+h,x+w-rr,y+h);
+        ctx.lineTo(x+rr,y+h);
+        ctx.quadraticCurveTo(x,y+h,x,y+h-rr);
+        ctx.lineTo(x,y+rr);
+        ctx.quadraticCurveTo(x,y,x+rr,y);
+    }
+
+// single scaled marker painter
     function drawMarker(
         ctx: CanvasRenderingContext2D,
         u: number, v: number, idx: number, s = 1
     ) {
-        const box = 22 * s;            // ⬆️ from 16 → 22
+        const box = 22 * s;
         const half = box / 2;
-        const r = 6 * s;               // corner radius
-        const dot = 5 * s;             // center dot
-        const lw = 4 * s;              // line width
-        const tagH = 20 * s;           // label height
+        const r = 6 * s;
+        const dot = 5 * s;
+        const lw = 4 * s;
+        const tagH = 20 * s;
         const padX = 7 * s;
 
         ctx.save();
@@ -197,7 +239,7 @@ export default function PixelToMapNoCanvas({
         ctx.arc(0, 0, dot, 0, Math.PI * 2);
         ctx.fill();
 
-        // tag above
+        // tag
         const txt = String(idx);
         ctx.font = `700 ${Math.round(16 * s)}px ui-monospace, Menlo, Consolas, monospace`;
         ctx.textAlign = "center";
@@ -211,76 +253,6 @@ export default function PixelToMapNoCanvas({
         ctx.fillText(txt, 0, y0 + tagH / 2);
 
         ctx.restore();
-    }
-
-    function roundRect(ctx: CanvasRenderingContext2D, x:number,y:number,w:number,h:number,r:number){
-        const rr = Math.min(r, w/2, h/2);
-        ctx.beginPath();
-        ctx.moveTo(x+rr,y);
-        ctx.lineTo(x+w-rr,y);
-        ctx.quadraticCurveTo(x+w,y,x+w,y+rr);
-        ctx.lineTo(x+w,y+h-rr);
-        ctx.quadraticCurveTo(x+w,y+h,x+w-rr,y+h);
-        ctx.lineTo(x+rr,y+h);
-        ctx.quadraticCurveTo(x,y+h,x,y+h-rr);
-        ctx.lineTo(x,y+rr);
-        ctx.quadraticCurveTo(x,y,x+rr,y);
-    }
-
-// ---- marker painter (matches your UI style) ----
-    function drawMarker(ctx: CanvasRenderingContext2D, u: number, v: number, idx: number) {
-        const box = 16;                   // square size in px
-        const half = box / 2;
-        ctx.save();
-        ctx.translate(u, v);
-
-        // red square
-        ctx.strokeStyle = "#ff2d2d";
-        ctx.lineWidth = 3;
-        ctx.fillStyle = "rgba(255,75,75,.12)";
-        roundRect(ctx, -half, -half, box, box, 5);
-        ctx.fill();
-        ctx.stroke();
-
-        // center dot
-        ctx.fillStyle = "#ff2d2d";
-        ctx.beginPath();
-        ctx.arc(0, 0, 3.5, 0, Math.PI * 2);
-        ctx.fill();
-
-        // tag above
-        const txt = String(idx);
-        ctx.font = "700 14px ui-monospace, Menlo, Consolas, monospace";
-        ctx.textAlign = "center";
-        ctx.textBaseline = "middle";
-        const padX = 6, padY = 3, h = 18;
-        const w = ctx.measureText(txt).width + padX * 2;
-        const y0 = -(half + 6 + h);
-
-        ctx.fillStyle = "#ff2d2d";
-        roundRect(ctx, -w / 2, y0, w, h, 6);
-        ctx.fill();
-
-        ctx.fillStyle = "#fff";
-        ctx.fillText(txt, 0, y0 + h / 2);
-
-        ctx.restore();
-    }
-
-// ---- small rounded-rect helper ----
-    function roundRect(ctx: CanvasRenderingContext2D, x: number, y: number, w: number, h: number, r: number) {
-        const rr = Math.min(r, w / 2, h / 2);
-        ctx.beginPath();
-        ctx.moveTo(x + rr, y);
-        ctx.lineTo(x + w - rr, y);
-        ctx.quadraticCurveTo(x + w, y, x + w, y + rr);
-        ctx.lineTo(x + w, y + h - rr);
-        ctx.quadraticCurveTo(x + w, y + h, x + w - rr, y + h);
-        ctx.lineTo(x + rr, y + h);
-        ctx.quadraticCurveTo(x, y + h, x, y + h - rr);
-        ctx.lineTo(x, y + rr);
-        ctx.quadraticCurveTo(x, y, x + rr, y);
-        // caller decides fill/stroke
     }
 
 
@@ -636,6 +608,7 @@ noData=${noData ?? "n/a"}`;
         setOut(prev=>prev + `\nDEM@Cam: groundAlt=${z.toFixed(2)} m AMSL → AGL=${(alt_m - z).toFixed(2)} m`);
     }
 
+
     // If user toggles auto-sample and we have DEM + valid lat/lon/alt, relink.
     useEffect(() => {
         (async () => {
@@ -645,6 +618,10 @@ noData=${noData ?? "n/a"}`;
         })();
         // eslint-disable-next-line react-hooks/exhaustive-deps
     }, [autoSampleDEM, dem, lat, lon, alt_m]);
+
+
+
+
 
     // ------------ file load + metadata parse ------------
     async function loadFile(f: File) {
@@ -980,6 +957,8 @@ noData=${noData ?? "n/a"}`;
             {!dem?.isGeographic4326 && dem && (
                 <div className={s.warn}>⚠ DEM CRS անծանոթ է (կամ ոչ EPSG:4326). Արդյունքը կարող է լինել սխալ, ցանկալի է 4326 GeoTIFF։</div>
             )}
+
+
         </>
     );
 
@@ -1038,6 +1017,7 @@ noData=${noData ?? "n/a"}`;
                     </tbody>
                 </table>
             </div>
+
         </>
     );
 
@@ -1046,35 +1026,35 @@ noData=${noData ?? "n/a"}`;
             <h3 className={s.h3}>Result</h3>
             <pre className={s.pre}>{out}</pre>
 
-            <h4 className={s.h4}>Parsed Metadata (key fields)</h4>
-            <pre className={s.preSmall}>
-{metaDump ? JSON.stringify({
-    Orientation: orientation,
-    GPSLatitude: metaDump.GPSLatitude,
-    GPSLongitude: metaDump.GPSLongitude,
-    GPSAltitude: metaDump.GPSAltitude,
-    GPSAltitudeRef: metaDump.GPSAltitudeRef,
-    AbsoluteAltitude: metaDump.AbsoluteAltitude,
-    RelativeAltitude: metaDump.RelativeAltitude,
-    GimbalYawDegree: metaDump.GimbalYawDegree,
-    GimbalPitchDegree: metaDump.GimbalPitchDegree,
-    GimbalRollDegree: metaDump.GimbalRollDegree,
-    FlightYawDegree: metaDump.FlightYawDegree,
-    FlightPitchDegree: metaDump.FlightPitchDegree,
-    FlightRollDegree: metaDump.FlightRollDegree,
-    CameraYaw: metaDump.CameraYaw,
-    CameraPitch: metaDump.CameraPitch,
-    CameraRoll: metaDump.CameraRoll,
-    FOV: metaDump.FOV,
-    FocalLength: metaDump.FocalLength,
-    FocalLengthIn35mmFormat: metaDump.FocalLengthIn35mmFormat,
-    Model: metaDump.Model,
-    Make: metaDump.Make,
-    UserComment: metaDump.UserComment,
-    ExifImageWidth: metaDump.ExifImageWidth,
-    ExifImageHeight: metaDump.ExifImageHeight,
-}, null, 2) : "—"}
-      </pre>
+{/*            <h4 className={s.h4}>Parsed Metadata (key fields)</h4>*/}
+{/*            <pre className={s.preSmall}>*/}
+{/*{metaDump ? JSON.stringify({*/}
+{/*    Orientation: orientation,*/}
+{/*    GPSLatitude: metaDump.GPSLatitude,*/}
+{/*    GPSLongitude: metaDump.GPSLongitude,*/}
+{/*    GPSAltitude: metaDump.GPSAltitude,*/}
+{/*    GPSAltitudeRef: metaDump.GPSAltitudeRef,*/}
+{/*    AbsoluteAltitude: metaDump.AbsoluteAltitude,*/}
+{/*    RelativeAltitude: metaDump.RelativeAltitude,*/}
+{/*    GimbalYawDegree: metaDump.GimbalYawDegree,*/}
+{/*    GimbalPitchDegree: metaDump.GimbalPitchDegree,*/}
+{/*    GimbalRollDegree: metaDump.GimbalRollDegree,*/}
+{/*    FlightYawDegree: metaDump.FlightYawDegree,*/}
+{/*    FlightPitchDegree: metaDump.FlightPitchDegree,*/}
+{/*    FlightRollDegree: metaDump.FlightRollDegree,*/}
+{/*    CameraYaw: metaDump.CameraYaw,*/}
+{/*    CameraPitch: metaDump.CameraPitch,*/}
+{/*    CameraRoll: metaDump.CameraRoll,*/}
+{/*    FOV: metaDump.FOV,*/}
+{/*    FocalLength: metaDump.FocalLength,*/}
+{/*    FocalLengthIn35mmFormat: metaDump.FocalLengthIn35mmFormat,*/}
+{/*    Model: metaDump.Model,*/}
+{/*    Make: metaDump.Make,*/}
+{/*    UserComment: metaDump.UserComment,*/}
+{/*    ExifImageWidth: metaDump.ExifImageWidth,*/}
+{/*    ExifImageHeight: metaDump.ExifImageHeight,*/}
+{/*}, null, 2) : "—"}*/}
+{/*      </pre>*/}
         </>
     );
 
@@ -1143,6 +1123,18 @@ noData=${noData ?? "n/a"}`;
                         <div className={s.modalHeader}>
                             <div className={s.title}>Image Viewer</div>
                             <div className={s.headerBtns}>
+
+
+                                <button
+                                    className={s.btn}
+                                    title={open ? "Hide side panels" : "Show side panels"}
+                                    onClick={() => setOpen(o => !o)}
+                                >
+                                    {open ? "✖ Hide panels" : "☰ Show panels"}
+                                </button>
+
+
+
                                 <button
                                     className={s.btn}
                                     title="Zoom in"
@@ -1159,7 +1151,7 @@ noData=${noData ?? "n/a"}`;
                                     className={s.btn}
                                     title="Unselect all points"
                                     onClick={() => { setPoints([]); setOut("Cleared all selected points."); }}
-                                >🧹 Clear</button>
+                                >🧹 Clear points</button>
 
                                 <button className={s.btn} onClick={()=>downloadAnnotatedImage("Aw-img.png")}>
                                     Download image
@@ -1179,8 +1171,9 @@ noData=${noData ?? "n/a"}`;
                         </div>
 
 
-                        <div className={s.modalBody}>
-                            <div className={s.imagePane}>
+                        <div className={`${s.modalBody} ${open ? s.panesOpen : s.panesClosed}`}>
+
+                        <div className={`${s.imagePane} ${open ? s.panesClosed : s.imagepaneS}`}>
                                 <div
                                     ref={viewerRef}
                                     className={`${s.viewer} ${panning ? s.grabbing : s.cursorPos}`}
@@ -1210,19 +1203,35 @@ noData=${noData ?? "n/a"}`;
                                 <div className={s.monoBright}>{pixelStr} · zoom: {scale.toFixed(2)}</div>
                             </div>
 
-                            <div className={s.infoPane}>{PoseIntrinsicsBlock}</div>
-                            <div className={s.resultPane}>
+                            <div className={s.infoPane} aria-hidden={!open}>{PoseIntrinsicsBlock}</div>
+                            <div className={s.resultPane} aria-hidden={!open}>
                                 {GoogleEarthTools}
                                 {ResultBlock}
                             </div>
+
+
                         </div>
                     </div>
+
                 </div>
             )}
+            {/* ===== Global loading overlay (covers whole app) ===== */}
+            {downloading && createPortal(
+                <div className={s.loadingOverlay} aria-busy="true" role="status">
+                    <div className={s.loader}>
+                        ⏳ Preparing image, please wait…
+                    </div>
+                </div>,
+                document.body
+            )}
+
 
         </>
+
     );
 }
+
+
 
 // ---- inputs ----
 function num(label: string, value: number, set: (v: number) => void, step: number = 1) {
@@ -1252,5 +1261,8 @@ function ZoomedImage({ src, imgW, imgH, scale, tx, ty }:
                  className={s.zoomImg}
                  style={{ transform: `translate(-50%, -50%) translate(${tx}px, ${ty}px) scale(${scale})` }} />
         </div>
+
     );
 }
+
+
