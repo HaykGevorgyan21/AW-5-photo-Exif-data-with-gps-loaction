@@ -16,7 +16,7 @@
 
     // --- sensor widths for FOV estimation ---
     const SENSOR_WIDTH_MM_BY_MODEL: Record<string, number> = { "ILCE-5100": 23.5, "ILCE-6000": 23.5, "ILCE-6100": 23.5, "ILCE-6300": 23.5, "ILCE-6400": 23.5, };
-    const DEM_OFFSET_M = 30
+    const DEM_OFFSET_M = 27
     type HitPoint = {
         id: number;
         name: string;
@@ -72,7 +72,13 @@
         const [fy, setFy] = useState(0);
         const [cx, setCx] = useState(0);
         const [cy, setCy] = useState(0);
-        const [fovx, setFovx] = useState(63); // deg fallback
+        const [fovx, setFovx] = useState(59.5);
+
+        const [k1, setK1] = useState(0);
+        const [k2, setK2] = useState(0);
+        const [p1, setP1] = useState(0);
+        const [p2, setP2] = useState(0);
+        const [k3, setK3] = useState(0);
 
         // ------------ pose ------------
         const [lat, setLat] = useState<number>(0);
@@ -104,6 +110,115 @@
         const [autoSampleDEM, setAutoSampleDEM] = useState<boolean>(true);
 
         // ------------ math helpers ------------
+
+
+// ---- Helpers: forward distortion + inverse (fixed-point) ----
+        function distortNormXY(x: number, y: number) {
+            const r2 = x*x + y*y;
+            const r4 = r2*r2, r6 = r4*r2;
+            const radial = 1 + k1*r2 + k2*r4 + k3*r6;
+            const x_tan = 2*p1*x*y + p2*(r2 + 2*x*x);
+            const y_tan = p1*(r2 + 2*y*y) + 2*p2*x*y;
+            return { xd: x*radial + x_tan, yd: y*radial + y_tan };
+        }
+
+
+        // observed pixel (u,v) -> undistorted pixel (uu,vv)
+        function undistortPixel(u: number, v: number, fx:number, fy:number, cx:number, cy:number) {
+            // normalize
+            const xn = (u - cx)/fx;
+            const yn = (v - cy)/fy;
+
+            // fixed-point invert: start from observed, iterate 5x
+            let xu = xn, yu = yn;
+            for (let i=0; i<5; i++) {
+                const r2 = xu*xu + yu*yu;
+                const r4 = r2*r2, r6 = r4*r2;
+                const radial = 1 + k1*r2 + k2*r4 + k3*r6;
+                const x_tan = 2*p1*xu*yu + p2*(r2 + 2*xu*xu);
+                const y_tan = p1*(r2 + 2*yu*yu) + 2*p2*xu*yu;
+
+                // forward distortion from current guess
+                const x_est = xu*radial + x_tan;
+                const y_est = yu*radial + y_tan;
+
+                // subtract error (simple fixed-point)
+                const ex = x_est - xn;
+                const ey = y_est - yn;
+                xu -= ex;
+                yu -= ey;
+            }
+            // back to pixels
+            return { uu: xu*fx + cx, vv: yu*fy + cy };
+        }
+
+        async function projectOnDEM(uDisp: number, vDisp: number) {
+            const basic = (() => {
+                const { u, v } = uvDisplayToSensor(uDisp, vDisp);
+                const _fx = Number.isFinite(fx) && fx !== 0 ? fx : fxFromFovX(imgW, fovx);
+                const _fy = Number.isFinite(fy) && fy !== 0 ? fy : _fx;
+                const _cx = Number.isFinite(cx) ? cx : imgW/2;
+                const _cy = Number.isFinite(cy) ? cy : imgH/2;
+
+                // undistort before ray
+                let uu = u, vv = v;
+                if (k1 || k2 || k3 || p1 || p2) {
+                    const uv = undistortPixel(u, v, _fx, _fy, _cx, _cy);
+                    uu = uv.uu; vv = uv.vv;
+                }
+
+                const x = (uu - _cx)/_fx, y = (vv - _cy)/_fy;
+                const R_base = [[1,0,0],[0,-1,0],[0,0,-1]] as number[][];
+                const R_yaw   = Rz(deg2rad(yaw || 0));
+                const R_pitch = Rx(deg2rad(-(pitch || 0)));
+                const R_roll  = Ry(deg2rad(roll || 0));
+                const R_enu_cam = matMul(R_yaw, matMul(R_pitch, matMul(R_roll, R_base)));
+                const d_enu = normalize( matVec(R_enu_cam, [x, y, 1]) );
+                return { d_enu, _fx, _fy };
+            })();
+
+            if (!basic) return null;
+            const { d_enu } = basic;
+            const dz = d_enu[2];
+            if (Math.abs(dz) < 1e-6) return null;
+
+            // initial guess with local plane at camera
+            let t = ( (groundAlt ?? 0) - (alt_m ?? 0) ) / dz;
+            if (!Number.isFinite(t) || t < 0) t = 1; // small positive fallback
+
+            let latCur = lat, lonCur = lon;
+            for (let i=0; i<8; i++) {
+                const { mlat, mlon } = metersPerDeg(latCur);
+                const xE = t * d_enu[0];
+                const yN = t * d_enu[1];
+
+                const latGuess = lat + yN / mlat;
+                const lonGuess = lon + xE / mlon;
+
+                // sample DEM altitude at the current (lat,lon)
+                const zGround = (dem ? await sampleDEM_AMSL(latGuess, lonGuess) : groundAlt) ?? groundAlt;
+                if (!Number.isFinite(zGround)) break;
+
+                const tNew = (zGround - (alt_m ?? 0)) / dz;
+                if (!Number.isFinite(tNew) || tNew < 0) break;
+
+                if (Math.abs(tNew - t) < 0.05) { // ~5cm change in t → converged
+                    // final lat/lon
+                    return { lat: latGuess, lon: lonGuess, range: Math.hypot(xE, yN) };
+                }
+                t = tNew;
+                latCur = latGuess; lonCur = lonGuess;
+            }
+
+            // final step after loop
+            const { mlat, mlon } = metersPerDeg(latCur);
+            const xE = t * d_enu[0], yN = t * d_enu[1];
+            return { lat: lat + yN/mlat, lon: lon + xE/mlon, range: Math.hypot(xE, yN) };
+        }
+
+
+
+
         const deg2rad = (d: number) => (d * Math.PI) / 180;
         function Rx(a: number) { const c = Math.cos(a), s = Math.sin(a); return [[1,0,0],[0,c,-s],[0,s,c]] as number[][]; }
         function Ry(a: number) { const c = Math.cos(a), s = Math.sin(a); return [[c,0,s],[0,1,0],[-s,0,c]] as number[][]; }
@@ -433,26 +548,36 @@
 
             const _fx = Number.isFinite(fx) && fx !== 0 ? fx : fxFromFovX(imgW, fovx);
             const _fy = Number.isFinite(fy) && fy !== 0 ? fy : _fx;
-            const _cx = Number.isFinite(cx) ? cx : imgW / 2;
-            const _cy = Number.isFinite(cy) ? cy : imgH / 2;
+            const _cx = Number.isFinite(cx) ? cx : imgW/2;
+            const _cy = Number.isFinite(cy) ? cy : imgH/2;
+
+            // ✅ undistort → ONE x,y
+            let uU = u, vU = v;
+            if (k1 || k2 || k3 || p1 || p2) {
+                const uv = undistortPixel(u, v, _fx, _fy, _cx, _cy);
+                uU = uv.uu; vU = uv.vv;
+            }
+            const x = (uU - _cx) / _fx;
+            const y = (vU - _cy) / _fy;
 
             const baseLat = Number.isFinite(lat) ? lat : 0;
             const baseLon = Number.isFinite(lon) ? lon : 0;
 
-            // Camera->ENU at nadir
             const R_base = [[1,0,0],[0,-1,0],[0,0,-1]] as number[][];
             const R_yaw   = Rz(deg2rad(yaw || 0));
-            const R_pitch = Rx(deg2rad(-(pitch || 0))); // +down
-            const R_roll  = Ry(deg2rad(roll || 0));     // +right
+            const R_pitch = Rx(deg2rad(-(pitch || 0)));
+            const R_roll  = Ry(deg2rad(roll || 0));
             const R_enu_cam = matMul(R_yaw, matMul(R_pitch, matMul(R_roll, R_base)));
 
-            const x = (u - _cx) / _fx;
-            const y = (v - _cy) / _fy;
+            // ❌ REMOVE these two lines (դրանք էին redeclare անում)
+            // const x = (u - _cx) / _fx;
+            // const y = (v - _cy) / _fy;
+
             const d_cam = normalize([x, y, 1]);
             const d_enu = matVec(R_enu_cam, d_cam);
 
-            const dz = d_enu[2];               // Up component
-            if (Math.abs(dz) < 1e-6) return null; // avoid grazing/parallel
+            const dz = d_enu[2];
+            if (Math.abs(dz) < 1e-6) return null;
 
             const camAlt = Number(alt_m) || 0;
             const gAlt   = Number(groundAlt) || 0;
@@ -465,6 +590,7 @@
             const { mlat, mlon } = metersPerDeg(baseLat);
             return { lat: baseLat + yN / mlat, lon: baseLon + xE / mlon, range: Math.hypot(xE, yN) };
         }
+
         // image (u,v) -> current viewer screen (x,y)
         function imgUVtoScreen(u: number, v: number, which: "preview" | "viewer") {
             const m = getDrawMetrics(which);
@@ -856,9 +982,27 @@
             if (!imgEl) { setOut("Load an image first."); return; }
             const uv = pickUV(e, "viewer");
             if (!uv) { setOut("Click is outside image."); return; }
-            if (!Number.isFinite(lat) || !Number.isFinite(lon)) { setOut("No GPS in metadata. Fill Latitude/Longitude first."); return; }
+            if (!Number.isFinite(lat) || !Number.isFinite(lon)) {
+                setOut("No GPS in metadata. Fill Latitude/Longitude first.");
+                return;
+            }
 
-            // If DEM present and opted-in, (re)sample ground at camera GPS
+            // Optionally refresh groundAlt/AGL from DEM at camera GPS
+            if (autoSampleDEM && dem) {
+                const z = await sampleDEM_AMSL(lat, lon);
+                if (z !== null) {
+                    setGroundAlt(z);
+                    if (Number.isFinite(alt_m)) setAgl(alt_m - z);
+                }
+            }
+
+            // ✅ compute hit once
+            let hit: { lat: number; lon: number; range?: number } | null = null;
+            if (dem) hit = await projectOnDEM(uv.u, uv.v);
+            if (!hit) hit = project(uv.u, uv.v) as any; // fallback plane
+            if (!hit) { setOut("Ray didn’t hit ground."); return; }
+
+            // keep AMSL↔AGL linkage in sync
             if (autoSampleDEM && dem) {
                 const z = await sampleDEM_AMSL(lat, lon);
                 if (z !== null) {
@@ -866,7 +1010,6 @@
                     if (Number.isFinite(alt_m)) setAgl(alt_m - z);
                 }
             } else {
-                // If no DEM, keep manual linkage
                 if (Number.isFinite(alt_m) && Number.isFinite(agl)) setGroundAlt(alt_m - agl);
             }
 
@@ -875,9 +1018,7 @@
                 return;
             }
 
-            const hit = project(uv.u, uv.v) as any;
-            if (!hit) { setOut("Ray didn’t hit the ground plane (up/behind). Check AMSL/AGL or pose."); return; }
-
+            // ✅ use the same 'hit'
             const decLat = hit.lat;
             const decLon = hit.lon;
             const dmsLat = toDMS(decLat, true);
@@ -887,6 +1028,7 @@
             const id = Date.now();
             const name = `P${nameCounter}`;
             setNameCounter(c => c + 1);
+
             const newPoint: HitPoint = {
                 id, name, pixelU: uv.u, pixelV: uv.v,
                 lat: decLat, lon: decLon,
@@ -908,6 +1050,7 @@
                 `Saved as ${name}.`
             ].join("\n"));
         };
+
         const onDoubleClick: React.MouseEventHandler<HTMLDivElement> = () => { setScale(1); setTx(0); setTy(0); };
 
         // ------------ UI blocks ------------
@@ -938,6 +1081,14 @@
                     {num("fy (px)", fy, setFy, 0.01)}
                     {num("cx (px)", cx, setCx, 0.01)}
                     {num("cy (px)", cy, setCy, 0.01)}
+
+                        {num("k1", k1, setK1, 1e-7)}
+                        {num("k2", k2, setK2, 1e-7)}
+                        {num("p1", p1, setP1, 1e-7)}
+                        {num("p2", p2, setP2, 1e-7)}
+                        {num("k3", k3, setK3, 1e-7)}
+
+
                 </div>
                 {num("FOVx (°) → auto fx/fy", fovx, setFovx, 0.01)}
                 <button className={s.btn} onClick={()=>{
