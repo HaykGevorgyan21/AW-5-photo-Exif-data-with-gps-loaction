@@ -937,3 +937,8 @@
     font-size: 1.1rem;
     box-shadow: 0 8px 28px rgba(0,0,0,0.6);
   }
+  .marker {
+    position: absolute;
+    pointer-events: none; // որ չխանգարի zoom/pan-ին
+    will-change: transform;
+  }
