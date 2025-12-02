@@ -1,0 +1,32 @@
+/* Մենյուն միշտ վերևում մնում է */
+.topmenu {
+  position: fixed;
+  top: 0;
+  left: 0;
+  right: 0;
+
+  height: 48px;
+  display: flex;
+  align-items: center;
+  gap: 24px;
+
+  padding: 0 20px;
+  background: #1f1f1f;
+  border-bottom: 1px solid #444;
+  z-index: 1000;
+}
+
+.topmenu a {
+  color: white;
+  font-size: 16px;
+  text-decoration: none;
+  font-weight: 500;
+}
+
+.topmenu a:hover {
+  color: #4ac9ff;
+}
+.page-container {
+  margin-top: 60px; /* navbar height + padding */
+  padding: 20px;
+}

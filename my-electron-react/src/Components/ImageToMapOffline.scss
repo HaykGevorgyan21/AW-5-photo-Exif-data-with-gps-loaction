@@ -1,0 +1,533 @@
+.im-root {
+  display: flex;
+  gap: 24px;
+  padding: 20px;
+  margin-top: 60px; // fixed navbar offset
+}
+
+/* LEFT column */
+.im-upload {
+  width: 350px;
+  flex-shrink: 0;
+}
+
+.upload-card {
+  background: #1f1f1f;
+  padding: 24px;
+  border-radius: 14px;
+  border: 1px solid #333;
+
+  h2 {
+    color: #eee;
+    font-size: 18px;
+    text-align: center;
+    margin-bottom: 20px;
+  }
+}
+
+.upload-box {
+  display: block;
+  background: #262626;
+  border: 2px dashed #555;
+  border-radius: 12px;
+  padding: 20px 10px;
+  cursor: pointer;
+  transition: 0.25s;
+
+  &:hover {
+    background: #2c2c2c;
+    border-color: #4ac9ff;
+  }
+}
+
+.upload-content {
+  text-align: center;
+
+  .icon {
+    font-size: 18px;
+    margin-bottom: 12px;
+  }
+
+  .text {
+    color: #aaa;
+
+    small {
+      color: #777;
+    }
+  }
+
+  .filename {
+    color: #4ac9ff;
+    font-weight: 500;
+  }
+}
+
+
+/* RIGHT — preview window */
+.im-preview {
+  flex-grow: 1;
+  background: #111;
+  border: 1px solid #333;
+  border-radius: 12px;
+  padding: 10px;
+  overflow: auto;
+  max-height: 85vh;
+}
+
+.image-preview-container {
+  overflow: auto;
+}
+
+.image-preview {
+  width: auto;   /* real width */
+  height: auto;  /* real height */
+  display: block;
+}
+
+.im-placeholder {
+  color: #555;
+  font-size: 18px;
+  text-align: center;
+  padding-top: 40px;
+}
+.image-preview-container {
+  width: 100%;
+  height: 350px;   // Same height as in your screenshot (~350px)
+  background: #111;
+  border-radius: 12px;
+  border: 1px solid #333;
+
+  display: flex;
+  justify-content: center;
+  align-items: center;
+
+  overflow: hidden;  // prevent scroll
+}
+
+.image-preview {
+  max-width: 100%;
+  max-height: 100%;
+  object-fit: contain;   // image SHRINK but NEVER crop
+  display: block;
+}
+.im-root {
+  display: flex;
+  flex-direction: row;
+  align-items: flex-start;     // ✔ preview and upload aligned to top
+  gap: 40px;
+  padding: 40px;
+  margin-top: 60px;            // navbar offset
+}
+
+/* LEFT column */
+.im-left {
+  width: 260px;                // ✔ smaller left column
+}
+
+.upload-card {
+  background: #1f1f1f;
+  padding: 20px;
+  border-radius: 14px;
+  border: 1px solid #333;
+}
+
+.upload-card h2 {
+  text-align: center;
+  color: #ddd;
+  font-size: 17px;
+  margin-bottom: 16px;
+}
+
+.upload-box {
+  background: #262626;
+  border: 2px dashed #555;
+  border-radius: 12px;
+  padding: 26px 10px;          // ✔ MUCH smaller box
+  cursor: pointer;
+  transition: 0.25s;
+}
+
+.upload-box:hover {
+  background: #2d2d2d;
+  border-color: #4ac9ff;
+}
+
+.upload-content {
+  text-align: center;
+}
+
+.icon {
+  font-size: 36px;
+  margin-bottom: 6px;
+}
+
+.filename {
+  color: #4ac9ff;
+  font-size: 14px;
+}
+
+/* RIGHT Preview Box */
+.im-right {
+  width: 720px;                // ✔ full preview width
+}
+
+.image-preview-container {
+  width: 100%;
+  height: 420px;               // ✔ raised preview
+  background: #111;
+  border: 1px solid #333;
+  border-radius: 12px;
+  display: flex;
+  justify-content: center;
+  align-items: center;
+  overflow: hidden;            // ✔ no scroll, clean preview
+}
+
+.image-preview {
+  max-width: 100%;
+  max-height: 100%;
+  object-fit: contain;
+  border-radius: 8px;
+}
+
+
+.im-root {
+  display: flex;
+  flex-direction: row;
+  align-items: flex-start;
+  gap: 40px;
+  padding: 35px;
+  margin-top: 60px; // navbar offset
+}
+
+/* LEFT column */
+.im-left {
+  width: 260px;
+  flex-shrink: 0;   // <- prevents resizing and shifting
+}
+
+/* UPLOAD CARD */
+.upload-card {
+  background: #1f1f1f;
+  padding: 20px;
+  border-radius: 14px;
+  border: 1px solid #333;
+}
+
+/* Smaller upload box */
+.upload-box {
+  background: #262626;
+  border: 2px dashed #555;
+  border-radius: 12px;
+  padding: 26px 10px;
+  cursor: pointer;
+  transition: 0.25s;
+}
+
+.upload-box:hover {
+  background: #2d2d2d;
+  border-color: #4ac9ff;
+}
+
+.upload-content {
+  text-align: center;
+}
+
+.icon {
+  font-size: 36px;
+  margin-bottom: 6px;
+}
+
+.filename {
+  color: #4ac9ff;
+  font-size: 14px;
+}
+
+/* RIGHT — PREVIEW COLUMN */
+.im-right {
+  width: 720px;       // <- FIXED WIDTH
+  flex-shrink: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+/* Locate button */
+.locate-btn {
+  background: #0078ff;
+  padding: 7px 16px;
+  border-radius: 8px;
+  color: white;
+  border: none;
+  width: max-content;
+  cursor: pointer;
+  font-size: 14px;
+}
+
+.locate-btn:hover {
+  background: #3b9cff;
+}
+
+/* FIXED PREVIEW PANEL */
+.image-preview-container {
+  width: 100%;
+  height: 420px;      // <- YOU WANTED THIS HEIGHT BACK
+  background: #111;
+  border-radius: 12px;
+  border: 1px solid #333;
+
+  display: flex;
+  justify-content: center;
+  align-items: center;
+
+  overflow: hidden; // <- prevents huge image from breaking layout
+}
+
+/* IMG STYLE: scaled to fit */
+.image-preview {
+  max-width: 100%;
+  max-height: 100%;
+  object-fit: contain;
+  border-radius: 8px;
+}
+
+
+
+.page {
+  display: flex;
+  flex-direction: row;
+  gap: 24px;
+  padding: 24px;
+  margin-top: 60px;  // navbar offset
+}
+
+/* LEFT COLUMN */
+.col-left {
+  width: 420px;
+  display: flex;
+  flex-direction: column;
+  gap: 20px;
+}
+
+/* CENTER COLUMN */
+.col-center {
+  flex: 1;
+  min-width: 350px;
+  display: flex;
+  flex-direction: column;
+  gap: 20px;
+}
+
+/* RIGHT COLUMN */
+.col-right {
+  width: 420px;
+  display: flex;
+  flex-direction: column;
+  gap: 20px;
+}
+
+/* PANEL STYLE */
+.panel {
+  background: #1f1f1f;
+  border: 1px solid #333;
+  border-radius: 12px;
+  padding: 18px 20px;
+}
+
+/* Upload box and preview */
+.upload-box {
+  background: #262626;
+  border: 2px dashed #555;
+  border-radius: 12px;
+  padding: 30px;
+  cursor: pointer;
+  text-align: center;
+  transition: 0.2s;
+}
+
+.upload-box:hover {
+  background: #2e2e2e;
+  border-color: #4ac9ff;
+}
+
+.preview {
+  height: 330px;
+  border-radius: 12px;
+  border: 1px solid #333;
+  background: #111;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  overflow: hidden;
+}
+
+.preview img {
+  max-width: 100%;
+  max-height: 100%;
+  object-fit: contain;
+}
+
+/* Buttons */
+.btn {
+  background: #1654ff;
+  border: none;
+  padding: 8px 16px;
+  color: white;
+  border-radius: 8px;
+  cursor: pointer;
+  font-size: 14px;
+}
+
+.btn:hover {
+  background: #2970ff;
+}
+.fullscreen-map {
+  position: fixed;
+  top: 0; left: 0;
+  width: 100vw;
+  height: 100vh;
+  background: #000;
+  z-index: 9999;
+}
+
+.leaflet-map {
+  width: 100%;
+  height: 100%;
+}
+
+.close-btn {
+  position: absolute;
+  top: 20px;
+  right: 20px;
+  background: #ff4444;
+  padding: 10px 14px;
+  border-radius: 6px;
+  color: white;
+  z-index: 10000;
+}
+.imap-overlay {
+  position: fixed;
+  inset: 0;
+  background: rgba(0,0,0,0.7);
+  z-index: 9999;
+  display: flex;
+  align-items:center;
+  justify-content:center;
+}
+
+.imap-window {
+  width: 90%;
+  height: 90%;
+  background: #111;
+  border-radius: 12px;
+  padding: 10px;
+  position: relative;
+}
+
+.imap-close {
+  position:absolute;
+  top:10px;
+  right:10px;
+  background:red;
+  padding:8px;
+  border:none;
+  color:white;
+  border-radius:5px;
+  cursor:pointer;
+}
+
+.imap-map {
+  width:100%;
+  height:100%;
+  border-radius:10px;
+}
+.itm-root {
+  padding: 20px;
+  color: white;
+}
+
+.layout {
+  display: flex;
+  gap: 20px;
+}
+
+.left {
+  width: 45%;
+}
+
+.right {
+  width: 45%;
+}
+
+.image-preview-container {
+  margin-top: 20px;
+  width: 100%;
+  height: 350px;
+  background: #111;
+  display: flex;
+  justify-content: center;
+  align-items: center;
+}
+
+.image-preview {
+  max-width: 100%;
+  max-height: 100%;
+  object-fit: contain;
+}
+
+.statusBox {
+  background: #222;
+  padding: 12px;
+  border-radius: 6px;
+}
+
+.locateBtn {
+  margin-top: 15px;
+  padding: 12px 20px;
+  background: #3b82f6;
+  border: none;
+  border-radius: 6px;
+  color: white;
+  cursor: pointer;
+}
+// ============================================================================
+// FILE: src/pages/ImageToMapOffline.scss
+// PURPOSE: Ensure modal/map is visible with proper sizing
+// ============================================================================
+.imagemap-backdrop {
+  position: fixed;
+  inset: 0;
+  background: rgba(0, 0, 0, 0.55);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  z-index: 9999;
+}
+.imagemap-container {
+  position: relative;
+  background: #1f1f1f;
+  border-radius: 12px;
+  padding: 12px;
+  width: 95vw;
+  max-width: 1200px;
+}
+.imagemap-close {
+  position: absolute;
+  top: 8px;
+  right: 8px;
+  border: none;
+  background: #2b2b2b;
+  color: #fff;
+  width: 36px;
+  height: 36px;
+  border-radius: 8px;
+  cursor: pointer;
+}
+.imagemap-map {
+  width: 90%;
+  height: 80vh;  /* <<< critical: without this, nothing is visible */
+  margin: 0 auto;
+  border-radius: 10px;
+  overflow: hidden;
+}
+

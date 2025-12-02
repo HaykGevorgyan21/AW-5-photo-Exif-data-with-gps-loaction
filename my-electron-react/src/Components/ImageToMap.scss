@@ -1,0 +1,53 @@
+
+// ============================================================================
+// FILE: src/Components/ImageToMap.scss
+// ============================================================================
+/* Make the app truly full width/height */
+html, body, #root { height: 100%; width: 100%; }
+body { margin: 0; }
+
+/* 2-column layout: wide map */
+.mp-layout {
+  display: grid;
+  grid-template-columns: 380px minmax(900px, 1fr); /* <- wider map */
+  gap: 16px;
+  padding: 16px;
+  height: calc(100vh - 56px); /* adjust if you have a top bar */
+  box-sizing: border-box;
+  width: 100%;
+}
+
+.mp-left {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  overflow: auto;
+}
+
+.card {
+  background: #1a1a1a;
+  border: 1px solid #2b2b2b;
+  border-radius: 12px;
+  padding: 14px;
+  color: #ddd;
+}
+
+.card h2 { font-size: 16px; margin: 0 0 10px; }
+
+.upload { position: relative; display: block; border: 2px dashed #3b3b3b; border-radius: 10px; background: #232323; overflow: hidden; cursor: pointer; }
+.upload input { position: absolute; inset: 0; opacity: 0; cursor: pointer; }
+.upload-ui { padding: 16px; text-align: center; }
+.upload-ui .title { font-weight: 600; margin-bottom: 4px; }
+.upload-ui .hint { color: #9aa1a6; font-size: 12px; }
+
+.preview { margin-top: 10px; height: 260px; background: #101010; border: 1px solid #2b2b2b; border-radius: 10px; display: grid; place-items: center; overflow: hidden; }
+.preview img { max-width: 100%; max-height: 100%; object-fit: contain; }
+
+.status { background: #141414; border: 1px solid #2b2b2b; border-radius: 8px; padding: 10px; height: 140px; overflow: auto; font-size: 12px; white-space: pre-wrap; }
+
+.primary { margin-top: 10px; background: #0a7cff; border: none; color: white; padding: 10px 14px; border-radius: 8px; cursor: pointer; }
+.primary:disabled { opacity: 0.5; cursor: not-allowed; }
+
+/* Right map pane fills everything */
+.mp-right { min-width: 0; background: #0d0d0d; border: 1px solid #2b2b2b; border-radius: 12px; overflow: hidden; }
+.mp-map { width: 100%; height: 100%; }

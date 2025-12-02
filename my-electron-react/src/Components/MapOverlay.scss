@@ -1,0 +1,36 @@
+.mapoverlay-backdrop {
+  position: fixed;
+  inset: 0;
+  background: rgba(0,0,0,0.75);
+  z-index: 9999;
+  display: flex;
+  justify-content: center;
+  align-items: center;
+}
+
+.mapoverlay-container {
+  width: 80%;
+  height: 80%;
+  position: relative;
+  border-radius: 10px;
+  overflow: hidden;
+}
+
+.mapoverlay-close {
+  position: absolute;
+  top: 8px;
+  right: 8px;
+  z-index: 10000;
+  background: #ef4444;
+  color: white;
+  border: none;
+  border-radius: 6px;
+  padding: 4px 8px;
+  cursor: pointer;
+  font-size: 16px;
+}
+
+.mapoverlay-map {
+  width: 100%;
+  height: 100%;
+}
