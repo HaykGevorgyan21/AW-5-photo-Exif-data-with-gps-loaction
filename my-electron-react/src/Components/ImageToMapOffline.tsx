@@ -3,6 +3,7 @@
 // Behavior change: DO NOT place image on map on "Place at EXIF GPS"/map click.
 // We only add MediaLayer + apply georeference AFTER user clicks "Apply 4+ pairs"
 // with at least 4 CP pairs. Includes previous preview fix (no top-left bug).
+// Plus: Coord-copy mode (click anywhere to copy Google Maps + KML).
 // ============================================================================
 
 import React, { useEffect, useRef, useState } from "react";
@@ -23,6 +24,21 @@ import Basemap from "@arcgis/core/Basemap";
 import "./ImageToMap.scss";
 
 const WGS84 = SpatialReference.WGS84;
+
+// ---------- small helpers (NEW) ----------
+async function copyToClipboard(text: string) {
+    try { await navigator.clipboard.writeText(text); return true; }
+    catch { return false; }
+}
+function gmPair(lat: number, lon: number) {              // Google Maps text input
+    return `${lat.toFixed(7)}, ${lon.toFixed(7)}`;
+}
+function gmUrl(lat: number, lon: number) {               // Google Maps URL
+    return `https://www.google.com/maps?q=${lat.toFixed(7)},${lon.toFixed(7)}`;
+}
+function kmlCoord(lon: number, lat: number, alt = 0) {   // Google Earth KML coord
+    return `${lon.toFixed(7)},${lat.toFixed(7)},${alt.toFixed(0)}`;
+}
 
 // ---------- math ----------
 const toRad = (d:number)=> d * Math.PI / 180;
@@ -199,6 +215,9 @@ export default function ImageToMapOffline(){
     const [opacity,setOpacity] = useState(95);
     const [keepInView,setKeepInView] = useState(true);
 
+    // NEW: Coord-copy mode
+    const [coordCopyMode, setCoordCopyMode] = useState(false);
+
     // frame
     const cornersRef = useRef<any[]|null>(null);
     const dragStateRef = useRef<any|null>(null);
@@ -285,6 +304,49 @@ export default function ImageToMapOffline(){
         const w2 = view.watch("width",  fitOnChange);
         const w3 = view.watch("height", fitOnChange);
 
+        // ----- CLICK HANDLER (REPLACED) -----
+        view.on("click", async (ev:any)=>{
+            const mp = ev.mapPoint ?? view.toMap({x:ev.x,y:ev.y});
+            if (!mp) return;
+
+            // 0) Coord-copy mode first — works anywhere (even over overlay)
+            if (coordCopyMode) {
+                const lat = +(+mp.latitude).toFixed(7);
+                const lon = +(+mp.longitude).toFixed(7);
+                const text =
+                    `Google Maps: ${gmPair(lat,lon)}\n` +
+                    `URL: ${gmUrl(lat,lon)}\n` +
+                    `KML: ${kmlCoord(lon,lat,0)}`;
+                const ok = await copyToClipboard(text);
+                setStatus(s => s + `\nPicked ${gmPair(lat,lon)} ${ok ? '(copied)' : ''}\nKML: ${kmlCoord(lon,lat,0)}`);
+                ev.stopPropagation();
+                return;
+            }
+
+            // 1) CP mode (image → map)
+            if (cpMode){
+                if (nextNeedsImageRef.current) return;
+                if (!photoEl) return;
+                setCpPairs(prev=>{
+                    const copy = prev.slice();
+                    const last = copy[copy.length-1];
+                    if (!last || last.map) return copy;
+                    last.map = { lat:+(+mp.latitude).toFixed(8), lon:+(+mp.longitude).toFixed(8) };
+                    drawCpLayer(copy);
+                    return copy;
+                });
+                nextNeedsImageRef.current = true;
+                ev.stopPropagation();
+                return;
+            }
+
+            // 2) Non-CP mode: prevent map gestures when hitting overlay frame/handles
+            if (cornersRef.current && (pickHandle(ev.x, ev.y) !== -1 || isInsidePolygonScreen(ev.x, ev.y))) {
+                ev.stopPropagation();
+                return;
+            }
+        });
+
         // drag (disabled in CP mode)
         view.on("drag", (ev:any)=>{
             if (!cornersRef.current || cpMode) return;
@@ -325,29 +387,8 @@ export default function ImageToMapOffline(){
             }
         });
 
-        // CP map-click
-        view.on("click", (ev:any)=>{
-            if (!cpMode) {
-                if (cornersRef.current && (pickHandle(ev.x, ev.y) !== -1 || isInsidePolygonScreen(ev.x, ev.y))) ev.stopPropagation();
-                return;
-            }
-            if (nextNeedsImageRef.current) return;
-            if (!photoEl) return;
-            const mp = ev.mapPoint ?? view.toMap({x:ev.x,y:ev.y}); if (!mp) return;
-            setCpPairs(prev=>{
-                const copy = prev.slice();
-                const last = copy[copy.length-1];
-                if (!last || last.map) return copy;
-                last.map = { lat:+(+mp.latitude).toFixed(8), lon:+(+mp.longitude).toFixed(8) };
-                drawCpLayer(copy);
-                return copy;
-            });
-            nextNeedsImageRef.current = true;
-            ev.stopPropagation();
-        });
-
         return ()=>{ w1.remove(); w2.remove(); w3.remove(); view.destroy(); };
-    },[keepInView, cpMode]);
+    },[keepInView, cpMode, coordCopyMode]);
 
     useEffect(()=>{ if (mediaLayerRef.current) mediaLayerRef.current.opacity = Math.max(0,Math.min(1,opacity/100)); },[opacity]);
 
@@ -382,19 +423,6 @@ export default function ImageToMapOffline(){
         drawFrameOnly(corners);
         if (!opts?.skipFit && !cpMode && keepInView) fitOverlayInsideView();
     }
-    function fitOverlayInsideView(){
-        if (isFittingRef.current) return;
-        const view=viewRef.current; if (!view?.extent) return;
-        const c = cornersRef.current; if (!c) return;
-
-        const xs=c.map((p:any)=>p.lon), ys=c.map((p:any)=>p.lat);
-        const bb = { xmin:Math.min(...xs), xmax:Math.max(...xs), ymin:Math.min(...ys), ymax:Math.max(...ys) };
-
-        const e=view.extent; const latMid=(e.ymin+e.ymax)/2;
-        const {mPerDegLat,mPerDegLon}=metersPerDegree(latMid);
-        const w=(bb.xmax-bb.xmin)*mPerDegLon, h=(bb.ymax-bbymin)*mPerDegLat; // typo fix below
-    }
-    // fix tiny typo above:
     function fitOverlayInsideView(){
         if (isFittingRef.current) return;
         const view=viewRef.current; if (!view?.extent) return;
@@ -745,6 +773,27 @@ export default function ImageToMapOffline(){
                         <input type="checkbox" checked={keepInView} onChange={e=>setKeepInView(e.target.checked)}/>
                         <span>Keep overlay inside the map (after edits)</span>
                     </label>
+                </div>
+
+                {/* NEW: Coord-copy card */}
+                <div className="card">
+                    <h2>📋 Coord copy</h2>
+                    <label style={{display:"flex",gap:8,alignItems:"center"}}>
+                        <input
+                            type="checkbox"
+                            checked={coordCopyMode}
+                            onChange={e=>{
+                                setCoordCopyMode(e.target.checked);
+                                setStatus(s => s + "\n" + (e.target.checked
+                                    ? "Coord copy ON: click anywhere to copy Google Maps + KML."
+                                    : "Coord copy OFF."));
+                            }}
+                        />
+                        <span>Enable: click map → copy (Google Maps & KML)</span>
+                    </label>
+                    <div style={{fontSize:12,opacity:0.8,marginTop:6}}>
+                        Copies: <code>lat, lon</code>, a Google Maps URL, and <code>lon,lat,0</code> (KML).
+                    </div>
                 </div>
 
                 <div className="card">
