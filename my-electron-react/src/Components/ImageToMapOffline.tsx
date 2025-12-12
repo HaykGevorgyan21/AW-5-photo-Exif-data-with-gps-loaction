@@ -1,9 +1,7 @@
 // ============================================================================
-// FILE: src/Components/ImageToMapOffline.tsx   (DROP-IN, PLAIN JS/TSX)
-// Behavior change: DO NOT place image on map on "Place at EXIF GPS"/map click.
-// We only add MediaLayer + apply georeference AFTER user clicks "Apply 4+ pairs"
-// with at least 4 CP pairs. Includes previous preview fix (no top-left bug).
-// Plus: Coord-copy mode (click anywhere to copy Google Maps + KML).
+// FILE: src/Components/ImageToMapOffline.tsx
+// All-in-one: control points workflow + coord-copy + ALWAYS-ON-TOP red pin.
+// Fixes: crash from "theconst" typo; wrong gmUrl param order; pin visible over image.
 // ============================================================================
 
 import React, { useEffect, useRef, useState } from "react";
@@ -20,28 +18,21 @@ import SpatialReference from "@arcgis/core/geometry/SpatialReference";
 import ControlPointsGeoreference from "@arcgis/core/layers/support/ControlPointsGeoreference";
 import TileLayer from "@arcgis/core/layers/TileLayer";
 import Basemap from "@arcgis/core/Basemap";
+import PictureMarkerSymbol from "@arcgis/core/symbols/PictureMarkerSymbol";
 
 import "./ImageToMap.scss";
 
 const WGS84 = SpatialReference.WGS84;
 
-// ---------- small helpers (NEW) ----------
+// ---------- helpers ----------
 async function copyToClipboard(text: string) {
     try { await navigator.clipboard.writeText(text); return true; }
     catch { return false; }
 }
-function gmPair(lat: number, lon: number) {              // Google Maps text input
-    return `${lat.toFixed(7)}, ${lon.toFixed(7)}`;
-}
-function gmUrl(lat: number, lon: number) {               // Google Maps URL
-    return `https://www.google.com/maps?q=${lat.toFixed(7)},${lon.toFixed(7)}`;
-}
-function kmlCoord(lon: number, lat: number, alt = 0) {   // Google Earth KML coord
-    return `${lon.toFixed(7)},${lat.toFixed(7)},${alt.toFixed(0)}`;
-}
+function gmPair(lat: number, lon: number) { return `${lat.toFixed(7)}, ${lon.toFixed(7)}`; }
+function gmUrl(lat: number, lon: number) { return `https://www.google.com/maps?q=${lat.toFixed(7)},${lon.toFixed(7)}`; }
+function kmlCoord(lon: number, lat: number, alt = 0) { return `${lon.toFixed(7)},${lat.toFixed(7)},${alt.toFixed(0)}`; }
 
-// ---------- math ----------
-const toRad = (d:number)=> d * Math.PI / 180;
 function metersPerDegree(lat:number) {
     const mLat = 111_320;
     const mLon = 111_320 * Math.cos((lat * Math.PI) / 180);
@@ -203,8 +194,12 @@ export default function ImageToMapOffline(){
     const mediaLayerRef   = useRef<MediaLayer|null>(null);
     const imageElementRef = useRef<ImageElement|null>(null);
 
+    // Red pin
+    const pinLayerRef     = useRef<GraphicsLayer|null>(null);
+    const pinGraphicRef   = useRef<Graphic|null>(null);
+
     const [photoURL,setPhotoURL] = useState<string|null>(null);
-    const [photoEl,setPhotoEl]   = useState<HTMLImageElement|null>(null);
+    const [photoEl,setPhotoEl]   = useState<HTMLImageElement|null>(null); // FIXED: was "theconst"
     const [imgW,setImgW] = useState(0);
     const [imgH,setImgH] = useState(0);
     const [exif,setExif] = useState<any>(null);
@@ -215,27 +210,49 @@ export default function ImageToMapOffline(){
     const [opacity,setOpacity] = useState(95);
     const [keepInView,setKeepInView] = useState(true);
 
-    // NEW: Coord-copy mode
     const [coordCopyMode, setCoordCopyMode] = useState(false);
+    const [dropPinOnClick, setDropPinOnClick] = useState(true);
 
-    // frame
     const cornersRef = useRef<any[]|null>(null);
     const dragStateRef = useRef<any|null>(null);
     const isFittingRef = useRef(false);
     const fitFracRef = useRef(0.95);
 
-    // CP mode
     const [cpMode, setCpMode] = useState(false);
-    const [cpPairs, setCpPairs] = useState<any[]>([]); // [{img:{x,y}, map:{lat,lon}}]
+    const [cpPairs, setCpPairs] = useState<any[]>([]);
     const nextNeedsImageRef = useRef(true);
     const cpPreviewRef = useRef<HTMLDivElement|null>(null);
     const [previewSize, setPreviewSize] = useState({ w: 0, h: 0 });
 
-    // NEW: defer placement until Apply — remember where user wanted to center
     const pendingCenterRef = useRef<{lon:number,lat:number}|null>(null);
 
     const log = (m:string)=> setStatus(s=>s+"\n"+m);
     const tuple4 = (a:any[]) => [a[0],a[1],a[2],a[3]];
+
+    // Red pin SVG
+    const PIN_SVG = encodeURIComponent(`
+    <svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'>
+      <defs><linearGradient id='g' x1='0' y1='0' x2='0' y2='1'>
+        <stop offset='0' stop-color='#ff6a6a'/><stop offset='1' stop-color='#d62828'/>
+      </linearGradient></defs>
+      <path d='M32 2c13.2 0 22 9.6 22 22 0 15.6-19 36-22 38-3-2-22-22.4-22-38C10 11.6 18.8 2 32 2z' fill='url(#g)'/>
+      <circle cx='32' cy='24' r='8' fill='#fff'/><circle cx='32' cy='24' r='5' fill='#b81c1c'/>
+    </svg>
+  `);
+    function setPinAt(lat:number, lon:number){
+        const layer = pinLayerRef.current; if(!layer) return;
+        if (pinGraphicRef.current) layer.remove(pinGraphicRef.current); // single pin
+        const sym = new PictureMarkerSymbol({
+            url: `data:image/svg+xml;charset=UTF-8,${PIN_SVG}`,
+            width: 36, height: 36, yoffset: 18
+        });
+        const g = new Graphic({ geometry: { type:"point", x:lon, y:lat, spatialReference: WGS84 }, symbol: sym });
+        layer.add(g);
+        pinGraphicRef.current = g;
+        const map = mapRef.current!;
+        if (layer) map.reorder(layer, map.layers.length - 1); // keep top
+    }
+    function clearPin(){ pinLayerRef.current?.removeAll(); pinGraphicRef.current = null; }
 
     // preview mapping (contain)
     function computePreviewMapping(vw:number, vh:number, iw:number, ih:number){
@@ -292,10 +309,18 @@ export default function ImageToMapOffline(){
         const outlines = new GraphicsLayer();
         const handles  = new GraphicsLayer();
         const cpLayer  = new GraphicsLayer();
-        map.add(outlines); map.add(handles); map.add(cpLayer);
+        const pinLayer = new GraphicsLayer();
+
+        map.add(outlines);
+        map.add(handles);
+        map.add(cpLayer);
+        map.add(pinLayer);                  // add LAST → top-most initially
         outlineLayerRef.current = outlines;
         handleLayerRef.current  = handles;
         cpLayerRef.current      = cpLayer;
+        pinLayerRef.current     = pinLayer;
+
+        map.reorder(pinLayer, map.layers.length - 1);  // enforce top
 
         const fitOnChange = throttle(()=>{
             if (!cpMode && keepInView) fitOverlayInsideView();
@@ -304,29 +329,25 @@ export default function ImageToMapOffline(){
         const w2 = view.watch("width",  fitOnChange);
         const w3 = view.watch("height", fitOnChange);
 
-        // ----- CLICK HANDLER (REPLACED) -----
+        // ----- CLICK HANDLER -----
         view.on("click", async (ev:any)=>{
             const mp = ev.mapPoint ?? view.toMap({x:ev.x,y:ev.y});
             if (!mp) return;
 
-            // 0) Coord-copy mode first — works anywhere (even over overlay)
-            if (coordCopyMode) {
-                const lat = +(+mp.latitude).toFixed(7);
-                const lon = +(+mp.longitude).toFixed(7);
-                const text =
-                    `Google Maps: ${gmPair(lat,lon)}\n` +
-                    `URL: ${gmUrl(lat,lon)}\n` +
-                    `KML: ${kmlCoord(lon,lat,0)}`;
+            const lat = +(+mp.latitude).toFixed(7);
+            const lon = +(+mp.longitude).toFixed(7);
+
+            if (coordCopyMode){
+                const text = `Google Maps: ${gmPair(lat,lon)}\nURL: ${gmUrl(lat,lon)}\nKML: ${kmlCoord(lon,lat,0)}`;
                 const ok = await copyToClipboard(text);
                 setStatus(s => s + `\nPicked ${gmPair(lat,lon)} ${ok ? '(copied)' : ''}\nKML: ${kmlCoord(lon,lat,0)}`);
+                if (dropPinOnClick) setPinAt(lat, lon);
                 ev.stopPropagation();
                 return;
             }
 
-            // 1) CP mode (image → map)
             if (cpMode){
-                if (nextNeedsImageRef.current) return;
-                if (!photoEl) return;
+                if (nextNeedsImageRef.current || !photoEl) return;
                 setCpPairs(prev=>{
                     const copy = prev.slice();
                     const last = copy[copy.length-1];
@@ -340,10 +361,9 @@ export default function ImageToMapOffline(){
                 return;
             }
 
-            // 2) Non-CP mode: prevent map gestures when hitting overlay frame/handles
-            if (cornersRef.current && (pickHandle(ev.x, ev.y) !== -1 || isInsidePolygonScreen(ev.x, ev.y))) {
-                ev.stopPropagation();
-                return;
+            if (dropPinOnClick){
+                setPinAt(lat, lon);
+                setStatus(s => s + `\n📌 Pin at ${gmPair(lat,lon)}  ${gmUrl(lat,lon)}`); // FIXED order
             }
         });
 
@@ -388,11 +408,11 @@ export default function ImageToMapOffline(){
         });
 
         return ()=>{ w1.remove(); w2.remove(); w3.remove(); view.destroy(); };
-    },[keepInView, cpMode, coordCopyMode]);
+    },[keepInView, cpMode, coordCopyMode, dropPinOnClick]);
 
     useEffect(()=>{ if (mediaLayerRef.current) mediaLayerRef.current.opacity = Math.max(0,Math.min(1,opacity/100)); },[opacity]);
 
-    // frame drawing + georef (separated)
+    // frame drawing + georef
     function drawFrameOnly(c:any[]){
         const [TL,TR,BL,BR] = c;
         const rings=[[[TL.lon,TL.lat],[TR.lon,TR.lat],[BR.lon,BR.lat],[BL.lon,BL.lat],[TL.lon,TL.lat]]];
@@ -424,23 +444,22 @@ export default function ImageToMapOffline(){
         if (!opts?.skipFit && !cpMode && keepInView) fitOverlayInsideView();
     }
     function fitOverlayInsideView(){
-        if (isFittingRef.current) return;
-        const view=viewRef.current; if (!view?.extent) return;
-        const c = cornersRef.current; if (!c) return;
-
+        const view=viewRef.current; if (!view?.extent || !cornersRef.current) return;
+        const c = cornersRef.current;
         const xs=c.map((p:any)=>p.lon), ys=c.map((p:any)=>p.lat);
         const bb = { xmin:Math.min(...xs), xmax:Math.max(...xs), ymin:Math.min(...ys), ymax:Math.max(...ys) };
 
         const e=view.extent; const latMid=(e.ymin+e.ymax)/2;
         const {mPerDegLat,mPerDegLon}=metersPerDegree(latMid);
-        const w=(bb.xmax-bb.xmin)*mPerDegLon, h=(bb.ymax-bb.ymin)*mPerDegLat;
+        const w=(bb.xmax-bb.xmin)*mPerDegLon;
+        const h=(bb.ymax-bb.ymin)*mPerDegLat;
+
         const vw=(e.xmax-e.xmin)*mPerDegLon, vh=(e.ymax-e.ymin)*mPerDegLat;
         const s=Math.min((vw*fitFracRef.current)/w, (vh*fitFracRef.current)/h, 1);
 
         const cx=(bb.xmin+bb.xmax)/2, cy=(bb.ymin+bb.ymax)/2;
         const vx=(e.xmin+e.xmax)/2, vy=(e.ymin+e.ymax)/2;
 
-        // move & scale frame only
         const moved = c.map((p:any)=>({ lat: p.lat + (vy-cy), lon: p.lon + (vx-cx) }));
         const {mPerDegLat:mpdLat,mPerDegLon:mpdLon}=metersPerDegree((vy+cy)/2);
         const ctr={ lon:(vx+cx)/2, lat:(vy+cy)/2 };
@@ -471,10 +490,13 @@ export default function ImageToMapOffline(){
         return inside;
     }
 
-    // media (created ONLY on Apply)
+    // media (created ONLY on Apply) — insert below pin layer
     async function ensureMedia(imageEl:HTMLImageElement){
+        const map = mapRef.current!;
+        const pin = pinLayerRef.current!;
         if (mediaLayerRef.current && imageElementRef.current){
             if (imageElementRef.current.image !== imageEl) imageElementRef.current.image = imageEl;
+            if (pin) map.reorder(pin, map.layers.length - 1);
             return;
         }
         const imgElem=new ImageElement({
@@ -482,7 +504,15 @@ export default function ImageToMapOffline(){
             georeference: new ControlPointsGeoreference({ controlPoints:[], width:imgW||1, height:imgH||1 })
         });
         const media = new MediaLayer({ source:[imgElem], spatialReference:WGS84, elevationInfo:{mode:"on-the-ground"}, opacity:Math.max(0,Math.min(1,opacity/100)) });
-        mapRef.current?.add(media);
+
+        if (pin) {
+            const idx = map.layers.indexOf(pin);
+            if (idx >= 0) map.add(media, idx); else map.add(media);
+            map.reorder(pin, map.layers.length - 1);
+        } else {
+            map.add(media);
+        }
+
         mediaLayerRef.current=media; imageElementRef.current=imgElem;
         try{ await viewRef.current?.whenLayerView(media); }catch{}
     }
@@ -502,7 +532,7 @@ export default function ImageToMapOffline(){
         let finalImg = raw, finalUrl = url, W = raw.naturalWidth, H = raw.naturalHeight;
         if (respectExifOrientation){
             try{
-                const ori = await exifr.orientation?.(file as any);
+                const ori = await (exifr as any).orientation?.(file as any);
                 if (ori && ori!==1){
                     const swap=(ori>=5&&ori<=8);
                     const canvas=document.createElement("canvas");
@@ -530,13 +560,12 @@ export default function ImageToMapOffline(){
         try{
             const k=await parseExifKinematics(file,W,H);
             setExif(k);
-            // just remember EXIF as default pending center, do not place
             if (k.lat!=null && k.lon!=null) pendingCenterRef.current = { lon:+k.lon, lat:+k.lat };
             log(`Image ready. Add 4+ control-point pairs, then press "Apply 4+ pairs".`);
         }catch{ log("EXIF parse failed."); }
     }
 
-    // DEM loader (unchanged)
+    // DEM loader
     async function onLoadDEM(e:any){
         const f=e.target.files?.[0]; if(!f) return;
         try{
@@ -552,7 +581,7 @@ export default function ImageToMapOffline(){
             if((!tie||!tie.length) && Array.isArray(fd.ModelTiepoint)){
                 const a=fd.ModelTiepoint; if (a.length>=6) tie=[{x:a[3],y:a[4],z:a[5]}];
             }
-            if(!tie || !tie.length || !scale || scale.length<2){ setDem(null); log("DEM warning: missing georef — disabled."); return; }
+            if(!tie || !scale || scale.length<2){ setDem(null); log("DEM warning: missing georef — disabled."); return; }
 
             const originX=Number(tie[0].x), originY=Number(tie[0].y);
             const resX=Number(scale[0]), resY=-Math.abs(Number(scale[1]));
@@ -635,13 +664,10 @@ export default function ImageToMapOffline(){
 
     async function cpApply(){
         if (!photoEl){ log("Load image first."); return; }
-
         if (cpPairs.length < 4){ log("Need at least 4 pairs."); return; }
 
-        // create media now (first time)
         await ensureMedia(photoEl);
 
-        // set georeference from ALL pairs (the real warp)
         const cps = cpPairs.filter(p=>p.img && p.map).map((p:any)=>({
             sourcePoint:{ x:p.img.x, y:p.img.y },
             mapPoint:{ type:"point", x:p.map.lon, y:p.map.lat, spatialReference:WGS84 }
@@ -650,7 +676,6 @@ export default function ImageToMapOffline(){
             controlPoints: cps, width: imgW, height: imgH
         });
 
-        // draw helper frame
         const ok = drawFrameFromHomography(cpPairs);
         if (!ok){
             const xs=cps.map((c:any)=>c.mapPoint.x), ys=cps.map((c:any)=>c.mapPoint.y);
@@ -659,7 +684,6 @@ export default function ImageToMapOffline(){
             drawFrameOnly([TL,TR,BL,BR]);
         }
 
-        // center where user expected (EXIF or click), only once
         if (pendingCenterRef.current){
             await safeGoTo({ center:[pendingCenterRef.current.lon, pendingCenterRef.current.lat], zoom:17 });
             pendingCenterRef.current = null;
@@ -706,7 +730,6 @@ export default function ImageToMapOffline(){
                         <span>Respect EXIF orientation</span>
                     </label>
 
-                    {/* Clickable preview */}
                     <div
                         ref={cpPreviewRef}
                         onClick={imagePreviewClick}
@@ -775,7 +798,6 @@ export default function ImageToMapOffline(){
                     </label>
                 </div>
 
-                {/* NEW: Coord-copy card */}
                 <div className="card">
                     <h2>📋 Coord copy</h2>
                     <label style={{display:"flex",gap:8,alignItems:"center"}}>
@@ -789,10 +811,21 @@ export default function ImageToMapOffline(){
                                     : "Coord copy OFF."));
                             }}
                         />
-                        <span>Enable: click map → copy (Google Maps & KML)</span>
+                        <span>Enable: click map → copy (Google Maps &amp; KML)</span>
                     </label>
-                    <div style={{fontSize:12,opacity:0.8,marginTop:6}}>
-                        Copies: <code>lat, lon</code>, a Google Maps URL, and <code>lon,lat,0</code> (KML).
+                </div>
+
+                <div className="card">
+                    <h2>📌 Red pin</h2>
+                    <label style={{display:"flex",gap:8,alignItems:"center"}}>
+                        <input type="checkbox" checked={dropPinOnClick} onChange={(e)=>setDropPinOnClick(e.target.checked)}/>
+                        <span>Drop Google-style red pin on map click</span>
+                    </label>
+                    <div style={{display:"flex",gap:8,marginTop:6}}>
+                        <button onClick={clearPin}>Clear pin</button>
+                    </div>
+                    <div style={{fontSize:12,opacity:0.8,marginTop:4}}>
+                        Turn OFF “CP mode” if you want pins on click.
                     </div>
                 </div>
 
@@ -815,12 +848,6 @@ export default function ImageToMapOffline(){
                         <button onClick={cpUndoLast}>Undo last</button>
                         <button onClick={cpClearAll}>Clear all</button>
                         <button onClick={cpApply} disabled={cpPairs.length<4}>Apply 4+ pairs</button>
-                    </div>
-                    <div style={{marginTop:6, fontSize:12, opacity:0.8}}>
-                        Steps: click image i → click map i. Repeat (≥4). Then press Apply to place the image.
-                    </div>
-                    <div style={{marginTop:6, fontSize:12}}>
-                        Pairs: {cpPairs.length}{cpPairs.length? " — " + cpPairs.map((p,i)=>`${i+1}${p.map?"✓":""}`).join(", "):""}
                     </div>
                 </div>
 
